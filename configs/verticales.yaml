@@ -1,0 +1,183 @@
+# Una entrada por vertical. Cada vertical conserva la regla con la que se desarrolló.
+# class_order va SIEMPRE de la clase más alta a la más baja.
+#
+# decision.regla:
+#   umbral_2clases  Medium (P >= medium) SÍ marca potencial          -> lavanderías, hoteles, panadería, gastro
+#   acumulada       probabilidad acumulada; con 2 clases el Medium NO marca -> bodegas, PM mercado
+#
+# feature_mean.modo:
+#   features  media del valor de cada feature   (columnas mean_<clase>, mean_potential_<clase>)
+#   shap      media del SHAP de cada feature    (columnas mean_, mean_pot_, mean_non_pot_)  -> PM
+#
+# id_col: columna que identifica una fila del Excel (cliente o mercado)
+# salida: nombre del archivo sin fecha. El Excel se guarda como <AAAAMMDD>_<salida>.xlsx
+
+# ---- bloques que se reutilizan (anclas YAML) -------------------------------------------
+comunes:
+  features_cliente: &feats_cliente [
+      "tip_documento", "des_provincia", "des_ciudad", "des_distrito", "X", "Y",
+      "des_segmento_estrategico", "cod_cliente_alicorp_actual", "DistanciaTiendaMass",
+      "score_urbanicidad", "total_ptos_de_interes", "pct_hogares_a", "pct_hogares_b",
+      "pct_hogares_c", "pct_hogares_d", "pct_hogares_e", "Mercado Abastos", "Mercado Mayorista",
+      "Colegio", "Universidad", "Terminal Buses", "Hospital", "Hotel", "Restaurante", "Banco",
+      "Residencial", "Grifo", "Centro Comercial", "Iglesia", "Supermercado", "Comida Rapida",
+      "Comp_BO_Tambo", "Comp_BO_Mass", "Comp_BO_Listo", "Comp_BO_Oxxo", "score_comercial",
+      "score_competencia", "cuadrante", "pct_venta_diaadia_insuma", "pct_descuento"
+  ]
+  categoricas_cliente: &cats_cliente [
+      "des_segmento_estrategico", "cod_cliente_alicorp_actual", "tip_documento", "des_provincia",
+      "des_ciudad", "des_distrito", "cuadrante"
+  ]
+  # agrupa el segmento transaccional en 2 clases (lavanderías, hoteles, panadería, gastro, PM)
+  target_map_2clases: &map_2clases
+    "1 Oro+": "1 Plata - Oro - Oro+"
+    "2 Oro": "1 Plata - Oro - Oro+"
+    "3 Plata": "1 Plata - Oro - Oro+"
+    "4 Bronce": "2 Bronce"
+  # hiperparámetros LightGBM por clase con modelo (todas menos la más alta)
+  lgbm_lavanderia: &lgbm_lav
+    "2 Bronce": {lambda_l2: 5.482429748904741, num_leaves: 22, feature_fraction: 0.8960158722102666, bagging_fraction: 0.9247333576750536, bagging_freq: 7, min_child_samples: 11}
+  lgbm_gastro: &lgbm_gas
+    "2 Bronce": {lambda_l2: 0.6479159808456662, num_leaves: 20, feature_fraction: 0.6151475400659933, bagging_fraction: 0.9415890979146138, bagging_freq: 7, min_child_samples: 8}
+
+verticales:
+
+  lavanderias:
+    salida: potential_estimations_lavanderia_nuevo
+    granularidad: cliente
+    id_col: "Cod Cliente DEX"
+    class_order: ["1 Plata - Oro - Oro+", "2 Bronce"]
+    decision: {regla: umbral_2clases, high: 0.75, medium: 0.50}
+    feature_mean:
+      modo: features
+      rmv_feats: &rmv_categoricas
+        - des_segmento_estrategico
+        - cod_cliente_alicorp_actual
+        - tip_documento
+        - des_provincia
+        - des_ciudad
+        - des_distrito
+        - cuadrante
+    modelo:
+      cluster_col: des_segmento_estrategico
+      target_map: *map_2clases
+      features: *feats_cliente
+      features_extra: []
+      categoricas: *cats_cliente
+      categoricas_extra: []
+      lgbm: *lgbm_lav
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 100}
+    export: {hoja_principal: "Potencial Estimaciones", hojas_extra: [], con_formato: true}
+
+  hoteles:
+    salida: potential_estimations_hotel_nuevo
+    granularidad: cliente
+    id_col: "Cod Cliente DEX"
+    class_order: ["1 Plata - Oro - Oro+", "2 Bronce"]
+    decision: {regla: umbral_2clases, high: 0.75, medium: 0.50}
+    feature_mean: {modo: features, rmv_feats: *rmv_categoricas}
+    modelo:   # mismos hiperparámetros que lavanderías (así estaban en los notebooks)
+      cluster_col: des_segmento_estrategico
+      target_map: *map_2clases
+      features: *feats_cliente
+      features_extra: []
+      categoricas: *cats_cliente
+      categoricas_extra: []
+      lgbm: *lgbm_lav
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 100}
+    export: {hoja_principal: "Potencial Estimaciones", hojas_extra: [], con_formato: true}
+
+  panaderia:
+    salida: potential_estimations_panaderia_nuevo
+    granularidad: cliente
+    id_col: "Cod Cliente DEX"
+    class_order: ["1 Plata - Oro - Oro+", "2 Bronce"]
+    decision: {regla: umbral_2clases, high: 0.75, medium: 0.50}
+    feature_mean: {modo: features, rmv_feats: *rmv_categoricas}
+    modelo:   # mismos hiperparámetros que lavanderías (así estaban en los notebooks)
+      cluster_col: des_segmento_estrategico
+      target_map: *map_2clases
+      features: *feats_cliente
+      features_extra: []
+      categoricas: *cats_cliente
+      categoricas_extra: []
+      lgbm: *lgbm_lav
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 100}
+    export: {hoja_principal: "Potencial Estimaciones", hojas_extra: [], con_formato: true}
+
+  gastro:
+    salida: potential_estimations_gastro_nuevo
+    granularidad: cliente
+    id_col: "Cod Cliente DEX"
+    class_order: ["1 Plata - Oro - Oro+", "2 Bronce"]
+    decision: {regla: umbral_2clases, high: 0.75, medium: 0.50}
+    feature_mean: {modo: features, rmv_feats: *rmv_categoricas}
+    modelo:
+      cluster_col: des_segmento_estrategico
+      target_map: *map_2clases
+      features: *feats_cliente
+      features_extra: []
+      categoricas: *cats_cliente
+      categoricas_extra: []
+      lgbm: *lgbm_gas
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 100}
+    export: {hoja_principal: "Potencial Estimaciones", hojas_extra: [], con_formato: true}
+
+  bodegas:
+    salida: potential_estimations_bodegas_nuevo
+    granularidad: cliente
+    id_col: "Cod Cliente DEX"
+    class_order: ["1 Oro+", "2 Oro", "3 Plata", "4 Bronce"]
+    decision: {regla: acumulada, high: 0.75, medium: 0.50}
+    feature_mean: {modo: features, rmv_feats: *rmv_categoricas}
+    modelo:
+      cluster_col: des_segmento_estrategico
+      target_map: null                 # bodegas usa las 4 clases tal cual
+      features: *feats_cliente
+      features_extra: [flg_cliente_perfecto]
+      categoricas: *cats_cliente
+      categoricas_extra: [flg_cliente_perfecto]
+      lgbm:
+        "4 Bronce": {lambda_l2: 0.025632322780049205, num_leaves: 38, feature_fraction: 0.7946789224038677, bagging_fraction: 0.9507670043813943, bagging_freq: 3, min_child_samples: 18}
+        "3 Plata": {lambda_l2: 0.006242812544397312, num_leaves: 23, feature_fraction: 0.5868320579833745, bagging_fraction: 0.9370738979514392, bagging_freq: 5, min_child_samples: 19}
+        "2 Oro": {lambda_l2: 0.7797017358052941, num_leaves: 31, feature_fraction: 0.9298900790068053, bagging_fraction: 0.9593938944473532, bagging_freq: 1, min_child_samples: 85}
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 10}
+    export: {hoja_principal: "Potencial Estimaciones", hojas_extra: [], con_formato: true}
+
+  pm_mercado:
+    salida: potential_estimations_market_level_mean_seg_pm
+    granularidad: mercado
+    id_col: mercado_id
+    class_order: ["1 Plata - Oro - Oro+", "2 Bronce"]
+    decision: {regla: acumulada, high: 0.66, medium: 0.50}
+    agregacion: {equifax_radio_km: 0.20}   # el que usaba el notebook; configurable acá
+    pdm: {factor_umbral: 0.25}   # paso final (PDM): umbral = media + factor_umbral * desviación
+    feature_mean: {modo: shap, rmv_feats: []}
+    modelo:
+      cluster_col: cod_cliente_alicorp_actual_mode
+      target_map: *map_2clases
+      features: [
+        "score_urbanicidad", "total_ptos_de_interes", "nro_viviendas", "POB", "pct_hogares_a",
+        "pct_hogares_b", "pct_hogares_c", "pct_hogares_d", "pct_hogares_e", "count_pm",
+        "pct_abarrotero", "pct_confitero", "pct_lavandero", "pct_tip_doc_dni", "pct_tip_doc_ruc",
+        "pct_tip_doc_cédula extranjera", "pct_cuadrante_batalla", "pct_cuadrante_oportunidad",
+        "pct_cuadrante_potencial", "pct_cuadrante_riesgo", "pct_true", "pct_false",
+        "pct_venta_diaadia_insuma", "pct_descuento", "score_comercial", "score_competencia",
+        "DistanciaTiendaMass", "Mercado Abastos", "Mercado Mayorista", "Colegio", "Universidad",
+        "Terminal Buses", "Hospital", "Hotel", "Restaurante", "Banco", "Residencial", "Grifo",
+        "Centro Comercial", "Iglesia", "Supermercado", "Comida Rapida", "Comp_BO_Tambo",
+        "Comp_BO_Mass", "Comp_BO_Listo", "Comp_BO_Oxxo", "cod_cliente_alicorp_actual_mode"
+      ]
+      features_extra: []
+      categoricas: [cod_cliente_alicorp_actual_mode]
+      categoricas_extra: []
+      lgbm:
+        "2 Bronce": {lambda_l2: 6.90773094301994, num_leaves: 34, feature_fraction: 0.9520572935217344, bagging_fraction: 0.6734736339652856, bagging_freq: 4, min_child_samples: 5}
+      split_validacion: 0.2
+      optuna: {activo: false, n_trials: 100}
+    export: {hoja_principal: "Potencial", hojas_extra: ["IDs mercado"], con_formato: false}

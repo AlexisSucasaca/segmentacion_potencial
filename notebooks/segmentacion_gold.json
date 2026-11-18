@@ -1,0 +1,404 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Segmentación gold — transaccional + estratégica + potencial\n",
+    "\n",
+    "Reemplaza a `notebook.ipynb`. Corre **después** de las 6 verticales (`correr_todo.ipynb` o los orquestadores por separado) — necesita sus Excel de salida.\n",
+    "\n",
+    "Dos modos (`MODO`, abajo):\n",
+    "- **`completo`**: recalcula y reemplaza las 3 segmentaciones para todo el universo.\n",
+    "- **`incremental`**: agrega clientes nuevos y completa lo que le faltaba a los que ya\n",
+    "  estaban, sin tocar `cod_boca_salida` ni reemplazar un dato ya asignado. Necesita leer\n",
+    "  la tabla gold actual."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "MODO = \"incremental\"  # \"completo\" | \"incremental\"\n",
+    "PERIODO = \"2026-08-01\"  # primer día del mes que se está cargando\n",
+    "\n",
+    "PROJECT_BQ = \"acpe-dev-uc-ml\"\n",
+    "PROJECT_STAGING = \"acpe-dev-uc-sandbox-aa\"\n",
+    "TABLA_STAGING = \"dev.tmp_segmentacion_0\"\n",
+    "TABLA_GOLD = \"acpe-prod-dlk-shrd-gld.delivery_cliente_gtm.cr_segmentacion\"\n",
+    "\n",
+    "RUTA_SALIDA_VERTICALES = \"../data_potential/output\"  # carpeta con los Excel de las 6 verticales + PDM\n",
+    "RUTA_ENCUESTAS = \"../data_potential/input\"  # carpeta con survey_bodega.csv, survey_pm.csv, etc.\n",
+    "RUTA_RESPALDO = \"../data_potential/output\"  # dónde guardar el Excel de respaldo (no es la fuente de verdad)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import sys, time\n",
+    "from pathlib import Path\n",
+    "\n",
+    "import pandas as pd\n",
+    "\n",
+    "sys.path.append(str(Path.cwd().parent))\n",
+    "\n",
+    "from src.config import load_config\n",
+    "from src.salidas import ultimo_archivo\n",
+    "from src.segmentacion_gold import (\n",
+    "    armar_df_final, aplicar_reglas_negocio, combinar_potencial, flag_mercado_potencial,\n",
+    "    preparar_para_upsert, union_encuestas, union_potencial_clientes, union_potencial_mercado_pdm,\n",
+    "    upsert_gold, validar_combinaciones,\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Fuentes — Excel de las 6 verticales + PDM\n",
+    "\n",
+    "Busca solo el más reciente de cada uno en `RUTA_SALIDA_VERTICALES` (por nombre de\n",
+    "archivo, que empieza con la fecha `AAAAMMDD`) — no hace falta escribir nombres a mano."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Buscando el Excel más reciente de cada vertical en ..\\data_potential\\output\n",
+      "  bodegas      -> 20260928_potential_estimations_bodegas_nuevo.xlsx\n",
+      "  panaderia    -> 20260928_potential_estimations_panaderia_nuevo.xlsx\n",
+      "  gastro       -> 20260928_potential_estimations_gastro_nuevo.xlsx\n",
+      "  hoteles      -> 20260928_potential_estimations_hotel_nuevo.xlsx\n",
+      "  lavanderias  -> 20260928_potential_estimations_lavanderia_nuevo.xlsx\n",
+      "  pm_mercado   -> 20260928_potential_estimations_market_level_mean_seg_pm.xlsx\n",
+      "  pdm          -> 20260928_Potencial_final_PDM.xlsx\n",
+      "\n",
+      "✓ Potencial: 34,963 clientes (5 verticales + PDM), 23,619 clientes con flg_mercado_potencial\n"
+     ]
+    }
+   ],
+   "source": [
+    "salida = Path(RUTA_SALIDA_VERTICALES)\n",
+    "cfg_verticales = load_config()\n",
+    "\n",
+    "def _excel_vertical(vertical: str) -> pd.DataFrame:\n",
+    "    ruta = ultimo_archivo(salida, f\"*{cfg_verticales[vertical]['salida']}.xlsx\")\n",
+    "    print(f\"  {vertical:12s} -> {ruta.name}\")\n",
+    "    return pd.read_excel(ruta)\n",
+    "\n",
+    "print(\"Buscando el Excel más reciente de cada vertical en\", salida)\n",
+    "salidas_vertical = {\n",
+    "    v: _excel_vertical(v) for v in [\"bodegas\", \"panaderia\", \"gastro\", \"hoteles\", \"lavanderias\"]\n",
+    "}\n",
+    "df_potencial_clientes = union_potencial_clientes(salidas_vertical)\n",
+    "\n",
+    "archivo_pm = ultimo_archivo(salida, f\"*{cfg_verticales['pm_mercado']['salida']}.xlsx\")\n",
+    "print(f\"  {'pm_mercado':12s} -> {archivo_pm.name}\")\n",
+    "df_potencial_pm = pd.read_excel(archivo_pm, sheet_name=\"Potencial\", usecols=[\"mercado_id\", \"flag_potential\"])\n",
+    "ids_mercado = pd.read_excel(archivo_pm, sheet_name=\"IDs mercado\").dropna()\n",
+    "df_potencial_mercado = flag_mercado_potencial(ids_mercado, df_potencial_pm)\n",
+    "\n",
+    "archivo_pdm = ultimo_archivo(salida, \"*Potencial_final_PDM.xlsx\")\n",
+    "print(f\"  {'pdm':12s} -> {archivo_pdm.name}\")\n",
+    "hojas_pdm = {\n",
+    "    \"abarroteros\": pd.read_excel(archivo_pdm, sheet_name=\"Abarroteros\"),\n",
+    "    \"lavanderos\": pd.read_excel(archivo_pdm, sheet_name=\"Lavanderos\"),\n",
+    "    \"impulso\": pd.read_excel(archivo_pdm, sheet_name=\"Impulso\"),\n",
+    "}\n",
+    "df_potencial_mercado_pdm = union_potencial_mercado_pdm(hojas_pdm)\n",
+    "\n",
+    "df_potencial = combinar_potencial(df_potencial_clientes, df_potencial_mercado_pdm)\n",
+    "print(f\"\\n✓ Potencial: {len(df_potencial):,} clientes (5 verticales + PDM), \"\n",
+    "      f\"{len(df_potencial_mercado):,} clientes con flg_mercado_potencial\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Encuestas"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "✓ 144,934 clientes con encuesta\n"
+     ]
+    }
+   ],
+   "source": [
+    "encuestas_dir = Path(RUTA_ENCUESTAS)\n",
+    "encuestas_por_vertical = {\n",
+    "    \"bodega\": pd.read_csv(encuestas_dir / \"survey_bodega.csv\"),\n",
+    "    \"pm\": pd.read_csv(encuestas_dir / \"survey_pm.csv\"),\n",
+    "    \"gastro\": pd.read_csv(encuestas_dir / \"survey_gastro.csv\"),\n",
+    "    \"panaderia\": pd.read_csv(encuestas_dir / \"survey_pan.csv\"),\n",
+    "    \"hotel\": pd.read_csv(encuestas_dir / \"survey_hotel.csv\"),\n",
+    "    \"lavanderia\": pd.read_csv(encuestas_dir / \"survey_lavanderia.csv\"),\n",
+    "}\n",
+    "df_encuestas = union_encuestas(encuestas_por_vertical)\n",
+    "print(f\"✓ {len(df_encuestas):,} clientes con encuesta\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Transaccional, estratégica y última oficina de venta (BigQuery)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "C:\\Users\\asucasacav\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\auth\\_default.py:114: UserWarning: Your application has authenticated using end user credentials from Google Cloud SDK without a quota project. You might receive a \"quota exceeded\" or \"API not enabled\" error. See the following page for troubleshooting: https://cloud.google.com/docs/authentication/adc-troubleshooting/user-creds. \n",
+      "  warnings.warn(_CLOUD_SDK_CREDENTIALS_WARNING)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "✓ Conectado a BigQuery\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "C:\\Users\\asucasacav\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\cloud\\bigquery\\table.py:1994: UserWarning: BigQuery Storage module not found, fetch data with the REST endpoint instead.\n",
+      "  warnings.warn(\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "✓ 215,728 clientes transaccionales\n",
+      "✓ 215,725 clientes estratégicos\n",
+      "✓ 338,966 últimas oficinas de venta\n"
+     ]
+    }
+   ],
+   "source": [
+    "from google.cloud import bigquery\n",
+    "\n",
+    "client = bigquery.Client(project=PROJECT_BQ)\n",
+    "print(\"✓ Conectado a BigQuery\")\n",
+    "\n",
+    "query_tranx = f\"\"\"\n",
+    "SELECT DISTINCT\n",
+    "    SAFE_CAST(REGEXP_REPLACE(cod_interlocutor, r'[^0-9]', '') AS INT64) AS cod_cliente_dex,\n",
+    "    a.des_segmento_transaccional as des_segmentacion_transaccional,\n",
+    "    a.cod_boca_salida,\n",
+    "    CAST(c.cod_cliente_actual AS INT64) AS cod_cliente_alicorp_actual\n",
+    "FROM `acpe-prod-uc-ml.delivery_gtm.dex_b2b_cmp_segmentacion_temp_estrategica_transaccional` a\n",
+    "LEFT JOIN `acpe-prod-dlk-shrd-gld.delivery_modelo_dimensional.cr_cliente_dex` b\n",
+    "    ON a.cod_interlocutor = b.cod_cliente_dex\n",
+    "LEFT JOIN `acpe-prod-dlk-shrd-gld.delivery_modelo_dimensional.cr_cliente_alicorp` c\n",
+    "    ON b.cod_sucursal = c.cod_sucursal\n",
+    "WHERE periodo = '{PERIODO}'\n",
+    "\"\"\"\n",
+    "df_tranx = client.query(query_tranx).to_dataframe()\n",
+    "print(f\"✓ {len(df_tranx):,} clientes transaccionales\")\n",
+    "\n",
+    "query_estrategico = f\"\"\"\n",
+    "SELECT\n",
+    "    SAFE_CAST(REGEXP_REPLACE(cod_interlocutor, r'[^0-9]', '') AS INT64) AS id_interlocutor_origen,\n",
+    "    des_segmento_estrategica AS segmento,\n",
+    "    cod_boca_salida\n",
+    "FROM `acpe-prod-uc-ml.delivery_gtm.dex_b2b_cmp_segmentacion_temp_estrategica_transaccional`\n",
+    "WHERE periodo = '{PERIODO}'\n",
+    "\"\"\"\n",
+    "df_estrategico = client.query(query_estrategico).to_dataframe()\n",
+    "print(f\"✓ {len(df_estrategico):,} clientes estratégicos\")\n",
+    "\n",
+    "query_last_values = \"\"\"\n",
+    "SELECT cod_cliente_dex, des_oficina_venta_alicorp, periodo\n",
+    "FROM (\n",
+    "    SELECT cod_cliente_dex, des_oficina_venta_alicorp, periodo,\n",
+    "           ROW_NUMBER() OVER (PARTITION BY cod_cliente_dex ORDER BY periodo DESC) AS rn\n",
+    "    FROM `acpe-prod-dlk-shrd-gld.delivery_reporte_comercial.cr_venta_sell_out`\n",
+    "    WHERE periodo IS NOT NULL\n",
+    ")\n",
+    "WHERE rn = 1\n",
+    "\"\"\"\n",
+    "last_values = client.query(query_last_values).to_dataframe()\n",
+    "print(f\"✓ {len(last_values):,} últimas oficinas de venta\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Armar la fila por cliente + reglas de negocio"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "c:\\Users\\asucasacav\\OneDrive - Grupo Alicorp\\Documentos\\Proyectos\\potencial_completo\\potencial\\src\\segmentacion_gold.py:167: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`\n",
+      "  df[\"flg_encuesta\"] = df[\"flg_encuesta\"].fillna(False)\n",
+      "c:\\Users\\asucasacav\\OneDrive - Grupo Alicorp\\Documentos\\Proyectos\\potencial_completo\\potencial\\src\\segmentacion_gold.py:171: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`\n",
+      "  df[\"flag_potential\"] = df[\"flag_potential\"].fillna(False)\n",
+      "c:\\Users\\asucasacav\\OneDrive - Grupo Alicorp\\Documentos\\Proyectos\\potencial_completo\\potencial\\src\\segmentacion_gold.py:222: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise an error in a future version of pandas. Value 'nan' has dtype incompatible with bool, please explicitly cast to a compatible dtype first.\n",
+      "  df.loc[(df[\"flg_encuesta\"] == False) & no_pm, \"flag_potential\"] = np.nan  # noqa: E712\n",
+      "c:\\Users\\asucasacav\\OneDrive - Grupo Alicorp\\Documentos\\Proyectos\\potencial_completo\\potencial\\src\\segmentacion_gold.py:248: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`\n",
+      "  df[\"des_segmentacion_transaccional\"] == \"Por definir\", np.nan, df[\"flag_potential\"].fillna(False)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "✓ 215,714 clientes en el cálculo fresco\n",
+      "✓ Todas las combinaciones (boca, segmento) son válidas\n"
+     ]
+    }
+   ],
+   "source": [
+    "df_final = armar_df_final(\n",
+    "    df_tranx, df_estrategico, df_encuestas, df_potencial_mercado, df_potencial, last_values, PERIODO,\n",
+    ")\n",
+    "df_final = aplicar_reglas_negocio(df_final)\n",
+    "print(f\"✓ {len(df_final):,} clientes en el cálculo fresco\")\n",
+    "\n",
+    "alertas = validar_combinaciones(df_final)\n",
+    "if not alertas.empty:\n",
+    "    print(f\"⚠️  {len(alertas):,} filas con (cod_boca_salida, des_segmento_estrategica) fuera de lo esperado:\")\n",
+    "    print(alertas.value_counts().head(10))\n",
+    "else:\n",
+    "    print(\"✓ Todas las combinaciones (boca, segmento) son válidas\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Modo incremental: leer la tabla gold actual"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "BadRequest",
+     "evalue": "400 Cannot query over table 'acpe-prod-dlk-shrd-gld.delivery_cliente_gtm.cr_segmentacion' without a filter over column(s) 'periodo' that can be used for partition elimination; reason: invalidQuery, location: query, message: Cannot query over table 'acpe-prod-dlk-shrd-gld.delivery_cliente_gtm.cr_segmentacion' without a filter over column(s) 'periodo' that can be used for partition elimination\n\nLocation: US\nJob ID: 87eb8cd5-a770-4292-af77-a9fb6d2d6f61\n",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[31m---------------------------------------------------------------------------\u001b[39m",
+      "\u001b[31mBadRequest\u001b[39m                                Traceback (most recent call last)",
+      "\u001b[36mCell\u001b[39m\u001b[36m \u001b[39m\u001b[32mIn[7]\u001b[39m\u001b[32m, line 3\u001b[39m\n\u001b[32m      1\u001b[39m df_gold_actual = \u001b[38;5;28;01mNone\u001b[39;00m\n\u001b[32m      2\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m MODO == \u001b[33m\"\u001b[39m\u001b[33mincremental\u001b[39m\u001b[33m\"\u001b[39m:\n\u001b[32m----> \u001b[39m\u001b[32m3\u001b[39m     df_gold_actual = \u001b[43mclient\u001b[49m\u001b[43m.\u001b[49m\u001b[43mquery\u001b[49m\u001b[43m(\u001b[49m\u001b[33;43mf\u001b[39;49m\u001b[33;43m\"\u001b[39;49m\u001b[33;43mSELECT * FROM `\u001b[39;49m\u001b[38;5;132;43;01m{\u001b[39;49;00m\u001b[43mTABLA_GOLD\u001b[49m\u001b[38;5;132;43;01m}\u001b[39;49;00m\u001b[33;43m`\u001b[39;49m\u001b[33;43m\"\u001b[39;49m\u001b[43m)\u001b[49m\u001b[43m.\u001b[49m\u001b[43mto_dataframe\u001b[49m\u001b[43m(\u001b[49m\u001b[43m)\u001b[49m\n\u001b[32m      4\u001b[39m     \u001b[38;5;28mprint\u001b[39m(\u001b[33mf\u001b[39m\u001b[33m\"\u001b[39m\u001b[33m✓ Tabla gold actual: \u001b[39m\u001b[38;5;132;01m{\u001b[39;00m\u001b[38;5;28mlen\u001b[39m(df_gold_actual)\u001b[38;5;132;01m:\u001b[39;00m\u001b[33m,\u001b[39m\u001b[38;5;132;01m}\u001b[39;00m\u001b[33m clientes\u001b[39m\u001b[33m\"\u001b[39m)\n\u001b[32m      6\u001b[39m df_para_subir = preparar_para_upsert(df_final, MODO, df_gold_actual=df_gold_actual)\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\cloud\\bigquery\\job\\query.py:2159\u001b[39m, in \u001b[36mQueryJob.to_dataframe\u001b[39m\u001b[34m(self, bqstorage_client, dtypes, progress_bar_type, create_bqstorage_client, max_results, geography_as_object, bool_dtype, int_dtype, float_dtype, string_dtype, date_dtype, datetime_dtype, time_dtype, timestamp_dtype, range_date_dtype, range_datetime_dtype, range_timestamp_dtype)\u001b[39m\n\u001b[32m   1929\u001b[39m \u001b[38;5;28;01mdef\u001b[39;00m\u001b[38;5;250m \u001b[39m\u001b[34mto_dataframe\u001b[39m(\n\u001b[32m   1930\u001b[39m     \u001b[38;5;28mself\u001b[39m,\n\u001b[32m   1931\u001b[39m     bqstorage_client: Optional[\u001b[33m\"\u001b[39m\u001b[33mbigquery_storage.BigQueryReadClient\u001b[39m\u001b[33m\"\u001b[39m] = \u001b[38;5;28;01mNone\u001b[39;00m,\n\u001b[32m   (...)\u001b[39m\u001b[32m   1951\u001b[39m     ] = DefaultPandasDTypes.RANGE_TIMESTAMP_DTYPE,\n\u001b[32m   1952\u001b[39m ) -> \u001b[33m\"\u001b[39m\u001b[33mpandas.DataFrame\u001b[39m\u001b[33m\"\u001b[39m:\n\u001b[32m   1953\u001b[39m \u001b[38;5;250m    \u001b[39m\u001b[33;03m\"\"\"Return a pandas DataFrame from a QueryJob\u001b[39;00m\n\u001b[32m   1954\u001b[39m \n\u001b[32m   1955\u001b[39m \u001b[33;03m    Args:\u001b[39;00m\n\u001b[32m   (...)\u001b[39m\u001b[32m   2157\u001b[39m \u001b[33;03m            :mod:`shapely` library cannot be imported.\u001b[39;00m\n\u001b[32m   2158\u001b[39m \u001b[33;03m    \"\"\"\u001b[39;00m\n\u001b[32m-> \u001b[39m\u001b[32m2159\u001b[39m     query_result = \u001b[43mwait_for_query\u001b[49m\u001b[43m(\u001b[49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mprogress_bar_type\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mmax_results\u001b[49m\u001b[43m=\u001b[49m\u001b[43mmax_results\u001b[49m\u001b[43m)\u001b[49m\n\u001b[32m   2160\u001b[39m     \u001b[38;5;28;01mreturn\u001b[39;00m query_result.to_dataframe(\n\u001b[32m   2161\u001b[39m         bqstorage_client=bqstorage_client,\n\u001b[32m   2162\u001b[39m         dtypes=dtypes,\n\u001b[32m   (...)\u001b[39m\u001b[32m   2176\u001b[39m         range_timestamp_dtype=range_timestamp_dtype,\n\u001b[32m   2177\u001b[39m     )\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\cloud\\bigquery\\_tqdm_helpers.py:107\u001b[39m, in \u001b[36mwait_for_query\u001b[39m\u001b[34m(query_job, progress_bar_type, max_results)\u001b[39m\n\u001b[32m    103\u001b[39m progress_bar = get_progress_bar(\n\u001b[32m    104\u001b[39m     progress_bar_type, \u001b[33m\"\u001b[39m\u001b[33mQuery is running\u001b[39m\u001b[33m\"\u001b[39m, default_total, \u001b[33m\"\u001b[39m\u001b[33mquery\u001b[39m\u001b[33m\"\u001b[39m\n\u001b[32m    105\u001b[39m )\n\u001b[32m    106\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m progress_bar \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[32m--> \u001b[39m\u001b[32m107\u001b[39m     \u001b[38;5;28;01mreturn\u001b[39;00m \u001b[43mquery_job\u001b[49m\u001b[43m.\u001b[49m\u001b[43mresult\u001b[49m\u001b[43m(\u001b[49m\u001b[43mmax_results\u001b[49m\u001b[43m=\u001b[49m\u001b[43mmax_results\u001b[49m\u001b[43m)\u001b[49m\n\u001b[32m    109\u001b[39m i = \u001b[32m0\u001b[39m\n\u001b[32m    110\u001b[39m \u001b[38;5;28;01mwhile\u001b[39;00m \u001b[38;5;28;01mTrue\u001b[39;00m:\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\cloud\\bigquery\\job\\query.py:1773\u001b[39m, in \u001b[36mQueryJob.result\u001b[39m\u001b[34m(self, page_size, max_results, retry, timeout, start_index, job_retry)\u001b[39m\n\u001b[32m   1768\u001b[39m     remaining_timeout = \u001b[38;5;28;01mNone\u001b[39;00m\n\u001b[32m   1770\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m remaining_timeout \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[32m   1771\u001b[39m     \u001b[38;5;66;03m# Since is_job_done() calls jobs.getQueryResults, which is a\u001b[39;00m\n\u001b[32m   1772\u001b[39m     \u001b[38;5;66;03m# long-running API, don't delay the next request at all.\u001b[39;00m\n\u001b[32m-> \u001b[39m\u001b[32m1773\u001b[39m     \u001b[38;5;28;01mwhile\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[43mis_job_done\u001b[49m\u001b[43m(\u001b[49m\u001b[43m)\u001b[49m:\n\u001b[32m   1774\u001b[39m         \u001b[38;5;28;01mpass\u001b[39;00m\n\u001b[32m   1775\u001b[39m \u001b[38;5;28;01melse\u001b[39;00m:\n\u001b[32m   1776\u001b[39m     \u001b[38;5;66;03m# Use a monotonic clock since we don't actually care about\u001b[39;00m\n\u001b[32m   1777\u001b[39m     \u001b[38;5;66;03m# daylight savings or similar, just the elapsed time.\u001b[39;00m\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\api_core\\retry\\retry_unary.py:294\u001b[39m, in \u001b[36mRetry.__call__.<locals>.retry_wrapped_func\u001b[39m\u001b[34m(*args, **kwargs)\u001b[39m\n\u001b[32m    290\u001b[39m target = functools.partial(func, *args, **kwargs)\n\u001b[32m    291\u001b[39m sleep_generator = exponential_sleep_generator(\n\u001b[32m    292\u001b[39m     \u001b[38;5;28mself\u001b[39m._initial, \u001b[38;5;28mself\u001b[39m._maximum, multiplier=\u001b[38;5;28mself\u001b[39m._multiplier\n\u001b[32m    293\u001b[39m )\n\u001b[32m--> \u001b[39m\u001b[32m294\u001b[39m \u001b[38;5;28;01mreturn\u001b[39;00m \u001b[43mretry_target\u001b[49m\u001b[43m(\u001b[49m\n\u001b[32m    295\u001b[39m \u001b[43m    \u001b[49m\u001b[43mtarget\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    296\u001b[39m \u001b[43m    \u001b[49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[43m.\u001b[49m\u001b[43m_predicate\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    297\u001b[39m \u001b[43m    \u001b[49m\u001b[43msleep_generator\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    298\u001b[39m \u001b[43m    \u001b[49m\u001b[43mtimeout\u001b[49m\u001b[43m=\u001b[49m\u001b[38;5;28;43mself\u001b[39;49m\u001b[43m.\u001b[49m\u001b[43m_timeout\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    299\u001b[39m \u001b[43m    \u001b[49m\u001b[43mon_error\u001b[49m\u001b[43m=\u001b[49m\u001b[43mon_error\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    300\u001b[39m \u001b[43m\u001b[49m\u001b[43m)\u001b[49m\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\api_core\\retry\\retry_unary.py:156\u001b[39m, in \u001b[36mretry_target\u001b[39m\u001b[34m(target, predicate, sleep_generator, timeout, on_error, exception_factory, **kwargs)\u001b[39m\n\u001b[32m    152\u001b[39m \u001b[38;5;66;03m# pylint: disable=broad-except\u001b[39;00m\n\u001b[32m    153\u001b[39m \u001b[38;5;66;03m# This function explicitly must deal with broad exceptions.\u001b[39;00m\n\u001b[32m    154\u001b[39m \u001b[38;5;28;01mexcept\u001b[39;00m \u001b[38;5;167;01mException\u001b[39;00m \u001b[38;5;28;01mas\u001b[39;00m exc:\n\u001b[32m    155\u001b[39m     \u001b[38;5;66;03m# defer to shared logic for handling errors\u001b[39;00m\n\u001b[32m--> \u001b[39m\u001b[32m156\u001b[39m     next_sleep = \u001b[43m_retry_error_helper\u001b[49m\u001b[43m(\u001b[49m\n\u001b[32m    157\u001b[39m \u001b[43m        \u001b[49m\u001b[43mexc\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    158\u001b[39m \u001b[43m        \u001b[49m\u001b[43mdeadline\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    159\u001b[39m \u001b[43m        \u001b[49m\u001b[43msleep_iter\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    160\u001b[39m \u001b[43m        \u001b[49m\u001b[43merror_list\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    161\u001b[39m \u001b[43m        \u001b[49m\u001b[43mpredicate\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    162\u001b[39m \u001b[43m        \u001b[49m\u001b[43mon_error\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    163\u001b[39m \u001b[43m        \u001b[49m\u001b[43mexception_factory\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    164\u001b[39m \u001b[43m        \u001b[49m\u001b[43mtimeout\u001b[49m\u001b[43m,\u001b[49m\n\u001b[32m    165\u001b[39m \u001b[43m    \u001b[49m\u001b[43m)\u001b[49m\n\u001b[32m    166\u001b[39m     \u001b[38;5;66;03m# if exception not raised, sleep before next attempt\u001b[39;00m\n\u001b[32m    167\u001b[39m     time.sleep(next_sleep)\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\api_core\\retry\\retry_base.py:214\u001b[39m, in \u001b[36m_retry_error_helper\u001b[39m\u001b[34m(exc, deadline, sleep_iterator, error_list, predicate_fn, on_error_fn, exc_factory_fn, original_timeout)\u001b[39m\n\u001b[32m    208\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m predicate_fn(exc):\n\u001b[32m    209\u001b[39m     final_exc, source_exc = exc_factory_fn(\n\u001b[32m    210\u001b[39m         error_list,\n\u001b[32m    211\u001b[39m         RetryFailureReason.NON_RETRYABLE_ERROR,\n\u001b[32m    212\u001b[39m         original_timeout,\n\u001b[32m    213\u001b[39m     )\n\u001b[32m--> \u001b[39m\u001b[32m214\u001b[39m     \u001b[38;5;28;01mraise\u001b[39;00m final_exc \u001b[38;5;28;01mfrom\u001b[39;00m\u001b[38;5;250m \u001b[39m\u001b[34;01msource_exc\u001b[39;00m\n\u001b[32m    215\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m on_error_fn \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[32m    216\u001b[39m     on_error_fn(exc)\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\api_core\\retry\\retry_unary.py:147\u001b[39m, in \u001b[36mretry_target\u001b[39m\u001b[34m(target, predicate, sleep_generator, timeout, on_error, exception_factory, **kwargs)\u001b[39m\n\u001b[32m    145\u001b[39m \u001b[38;5;28;01mwhile\u001b[39;00m \u001b[38;5;28;01mTrue\u001b[39;00m:\n\u001b[32m    146\u001b[39m     \u001b[38;5;28;01mtry\u001b[39;00m:\n\u001b[32m--> \u001b[39m\u001b[32m147\u001b[39m         result = \u001b[43mtarget\u001b[49m\u001b[43m(\u001b[49m\u001b[43m)\u001b[49m\n\u001b[32m    148\u001b[39m         \u001b[38;5;28;01mif\u001b[39;00m inspect.isawaitable(result):\n\u001b[32m    149\u001b[39m             warnings.warn(_ASYNC_RETRY_WARNING)\n",
+      "\u001b[36mFile \u001b[39m\u001b[32m~\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\google\\cloud\\bigquery\\job\\query.py:1722\u001b[39m, in \u001b[36mQueryJob.result.<locals>.is_job_done\u001b[39m\u001b[34m()\u001b[39m\n\u001b[32m   1699\u001b[39m \u001b[38;5;28;01mif\u001b[39;00m job_failed_exception \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[32m   1700\u001b[39m     \u001b[38;5;66;03m# Only try to restart the query job if the job failed for\u001b[39;00m\n\u001b[32m   1701\u001b[39m     \u001b[38;5;66;03m# a retriable reason. For example, don't restart the query\u001b[39;00m\n\u001b[32m   (...)\u001b[39m\u001b[32m   1719\u001b[39m     \u001b[38;5;66;03m# into an exception that can be processed by the\u001b[39;00m\n\u001b[32m   1720\u001b[39m     \u001b[38;5;66;03m# `job_retry` predicate.\u001b[39;00m\n\u001b[32m   1721\u001b[39m     restart_query_job = \u001b[38;5;28;01mTrue\u001b[39;00m\n\u001b[32m-> \u001b[39m\u001b[32m1722\u001b[39m     \u001b[38;5;28;01mraise\u001b[39;00m job_failed_exception\n\u001b[32m   1723\u001b[39m \u001b[38;5;28;01melse\u001b[39;00m:\n\u001b[32m   1724\u001b[39m     \u001b[38;5;66;03m# Make sure that the _query_results are cached so we\u001b[39;00m\n\u001b[32m   1725\u001b[39m     \u001b[38;5;66;03m# can return a complete RowIterator.\u001b[39;00m\n\u001b[32m   (...)\u001b[39m\u001b[32m   1731\u001b[39m     \u001b[38;5;66;03m# making any extra API calls if the previous loop\u001b[39;00m\n\u001b[32m   1732\u001b[39m     \u001b[38;5;66;03m# iteration fetched the finished job.\u001b[39;00m\n\u001b[32m   1733\u001b[39m     \u001b[38;5;28mself\u001b[39m._reload_query_results(\n\u001b[32m   1734\u001b[39m         retry=retry, **reload_query_results_kwargs\n\u001b[32m   1735\u001b[39m     )\n",
+      "\u001b[31mBadRequest\u001b[39m: 400 Cannot query over table 'acpe-prod-dlk-shrd-gld.delivery_cliente_gtm.cr_segmentacion' without a filter over column(s) 'periodo' that can be used for partition elimination; reason: invalidQuery, location: query, message: Cannot query over table 'acpe-prod-dlk-shrd-gld.delivery_cliente_gtm.cr_segmentacion' without a filter over column(s) 'periodo' that can be used for partition elimination\n\nLocation: US\nJob ID: 87eb8cd5-a770-4292-af77-a9fb6d2d6f61\n"
+     ]
+    }
+   ],
+   "source": [
+    "df_gold_actual = None\n",
+    "if MODO == \"incremental\":\n",
+    "    df_gold_actual = client.query(f\"SELECT * FROM `{TABLA_GOLD}`\").to_dataframe()\n",
+    "    print(f\"✓ Tabla gold actual: {len(df_gold_actual):,} clientes\")\n",
+    "\n",
+    "df_para_subir = preparar_para_upsert(df_final, MODO, df_gold_actual=df_gold_actual)\n",
+    "print(f\"✓ Filas a subir al MERGE ({MODO}): {len(df_para_subir):,}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Respaldo en Excel (no es la fuente de verdad — la tabla gold sí lo es)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fecha = time.strftime(\"%Y%m%d\")\n",
+    "ruta_respaldo = Path(RUTA_RESPALDO) / f\"{fecha}_segmentacion_{MODO}.xlsx\"\n",
+    "ruta_respaldo.parent.mkdir(parents=True, exist_ok=True)\n",
+    "df_para_subir.to_excel(ruta_respaldo, index=False)\n",
+    "print(f\"✓ Respaldo guardado en {ruta_respaldo}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. MERGE a la tabla gold"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sql = upsert_gold(df_para_subir, client, TABLA_STAGING, TABLA_GOLD, PROJECT_STAGING)\n",
+    "print(f\"✓ MERGE ejecutado contra {TABLA_GOLD}\")\n",
+    "print(sql)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
