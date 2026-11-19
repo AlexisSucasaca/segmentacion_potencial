@@ -391,7 +391,7 @@ def aplicar_invariante_potencial(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------- PA: segmento estratégico exclusivo de una tabla
 ESTADIOS_PA = ("Estadio 1", "Estadio 2", "Estadio 3", "Estadio 4")
 _COLS_CLIENTE_PA = ("cod_interlocutor", "cod_cliente_dex", "id_interlocutor_origen", "external_store_id", "cod_cliente")
-_COLS_SEGMENTO_PA = ("des_segmento_estrategica", "des_segmento_estrategico", "segmento_estrategico",
+_COLS_SEGMENTO_PA = ("seg_estrategico", "des_segmento_estrategica", "des_segmento_estrategico", "segmento_estrategico",
                      "segmento_estrategica", "estadio", "segmento")
 
 

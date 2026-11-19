@@ -580,3 +580,12 @@ def test_preparar_carga_periodo_pasa_la_tabla_de_pa_al_incremental():
     fresco, _ = aplicar_segmento_pa(_pa_fresco(), _tabla_pa())
     out = preparar_carga_periodo(fresco, "incremental", gold_periodo_anterior=_pa_gold(), segmento_pa=_tabla_pa())
     assert out.set_index("cod_interlocutor").loc["0000000001", "des_segmento_estrategica"] == "Estadio 2"
+
+
+def test_preparar_segmento_pa_con_el_esquema_real_de_la_tabla():
+    df = pd.DataFrame({"cod_cliente_dex": ["0000021376", "0001686623"], "seg_estrategico": ["Estadio 1", "Estadio 1"],
+                       "fuente": ["excel_respetado"] * 2, "estadio_excel": ["Estadio 1"] * 2,
+                       "estadio_encuesta": [None, None], "contradice_encuesta": [False, False]})
+    out = preparar_segmento_pa(df)
+    assert out["cod_interlocutor"].tolist() == ["0000021376", "0001686623"]
+    assert set(out["des_segmento_estrategica"]) == {"Estadio 1"}
