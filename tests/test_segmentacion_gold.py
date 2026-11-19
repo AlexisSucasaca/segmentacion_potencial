@@ -2,7 +2,8 @@
 
 `test_equivale_al_notebook_original` reproduce, tal cual, las celdas 15-35 del notebook
 original (sin la consulta a BigQuery) y compara contra `armar_df_final` + `aplicar_reglas_negocio`.
-Los demás tests cubren cada pieza por separado y los dos modos de ejecución.
+Los demás tests cubren cada pieza por separado y los dos modos de ejecución
+(`completo` e `incremental`, con la alterna del trax como autoridad de boca y transaccional).
 """
 from __future__ import annotations
 
@@ -11,9 +12,11 @@ import pandas as pd
 import pytest
 
 from src.segmentacion_gold import (
-    COLUMNAS_GOLD, aplicar_reglas_negocio, armar_df_final, build_merge_query, combinar_potencial,
-    filtrar_incremental, flag_mercado_potencial, preparar_para_upsert, ultimo_dia_mes,
+    COLUMNAS_GOLD, aplicar_reglas_negocio, armar_df_final, cargar_periodo_gold, clasificar_salidas,
+    combinar_potencial, completar_incremental, construir_insert_gold, detectar_regresiones,
+    detectar_salidas, flag_mercado_potencial, grupo_boca, preparar_carga_periodo, ultimo_dia_mes,
     union_encuestas, union_potencial_clientes, union_potencial_mercado_pdm, validar_combinaciones,
+    validar_incremental,
 )
 
 
@@ -114,13 +117,15 @@ def _notebook_original(df_tranx, df_estrategico, df_encuestas, df_potencial_merc
     df_final["periodo"] = pd.Timestamp(periodo)
     df_final["fec_corrida"] = ultimo_dia_mes(periodo)
 
-    valid_ab_bo_mm = ["Alejada", "Clásica", "Estrella"]
-    mask = df_final["cod_boca_salida"].isin(["AB", "BO", "MM"])
-    df_final.loc[mask & ~df_final["des_segmentacion_estrategica"].isin(valid_ab_bo_mm), "des_segmentacion_estrategica"] = "Clásica"
-
+    # Diferencia deliberada 5 del módulo: GO se reemplaza por su boca real ANTES de las reglas por boca
+    # (el notebook original lo hacía después de la regla de AB/BO/MM).
     mask_go = df_final["cod_boca_salida"] == "GO"
     df_final.loc[mask_go, "cod_boca_salida"] = df_final.loc[mask_go, "cod_boca_salida_vs2"]
     df_final = df_final.drop(columns=["cod_boca_salida_vs2"], errors="ignore")
+
+    valid_ab_bo_mm = ["Alejada", "Clásica", "Estrella"]
+    mask = df_final["cod_boca_salida"].isin(["AB", "BO", "MM"])
+    df_final.loc[mask & ~df_final["des_segmentacion_estrategica"].isin(valid_ab_bo_mm), "des_segmentacion_estrategica"] = "Clásica"
 
     valid_pm = ["Abarrotero", "Confitero", "Lavandero"]
     mask_pm = df_final["cod_boca_salida"] == "PM"
@@ -128,7 +133,8 @@ def _notebook_original(df_tranx, df_estrategico, df_encuestas, df_potencial_merc
 
     valid_pa = ["Estadio 1", "Estadio 2", "Estadio 3", "Estadio 4"]
     mask_pa = df_final["cod_boca_salida"] == "PA"
-    df_final.loc[mask_pa & ~df_final["des_segmentacion_estrategica"].isin(valid_pa), "des_segmentacion_estrategica"] = ""
+    # Diferencia deliberada 4: en PA un segmento no válido/vacío queda "Por definir" (el original dejaba '').
+    df_final.loc[mask_pa & ~df_final["des_segmentacion_estrategica"].isin(valid_pa), "des_segmentacion_estrategica"] = "Por definir"
 
     valid_lv = ["Hotel/Casino", "Lavanderia", "Otros Limpieza"]
     mask_lv = df_final["cod_boca_salida"] == "LV"
@@ -220,161 +226,229 @@ def test_validar_combinaciones():
 
 
 # ---------------------------------------------------------------- modo incremental
+def _fila(cod, boca, transac, estrat, flg, pred, periodo, fec, oficina="Lima"):
+    return {
+        "periodo": pd.Timestamp(periodo), "cod_interlocutor": cod, "cod_boca_salida": boca,
+        "des_segmento_transaccional": transac, "des_segmento_estrategica": estrat,
+        "flg_encuesta": True, "flg_mercado_potencial": False, "flg_potential": flg,
+        "des_potencial_predic": pred, "des_oficina_venta": oficina, "fec_proceso": pd.Timestamp(fec),
+    }
+
+
 def _gold_base():
-    return pd.DataFrame({
-        "periodo": pd.Timestamp("2026-05-01"), "cod_interlocutor": ["0000000001", "0000000002", "0000000003"],
-        "cod_boca_salida": ["BO", "BO", "PA"], "des_segmento_transaccional": ["1 Oro+", "2 Oro", "2 Oro"],
-        "des_segmento_estrategica": ["Clásica", None, "Estadio 1"],
-        "flg_encuesta": [True, True, False], "flg_mercado_potencial": [False, False, False],
-        "flg_potential": [True, None, False], "des_potencial_predic": ["2 Bronce", None, None],
-        "des_oficina_venta": ["Lima", "Lima", "Norte"], "fec_proceso": pd.Timestamp("2026-05-31"),
-    })
+    """Periodo anterior (2026-05-01). Cada cliente ejercita un caso."""
+    f = lambda *a, **k: _fila(*a, periodo="2026-05-01", fec="2026-05-31", **k)  # noqa: E731
+    return pd.DataFrame([
+        f("0000000001", "BO", "1 Oro+", "Clásica", True, "2 Bronce"),            # conservado
+        f("0000000002", "AB", "Por definir", "Por definir", None, None),         # se resuelve; conserva AB
+        f("0000000003", "PA", "2 Oro", "Estadio 1", False, None),                # conserva potencial False
+        f("0000000004", "BO", "2 Oro", "Clásica", True, "2 Bronce"),             # cambia de grupo: BO -> PM
+        f("0000000005", "BO", "3 Plata", "Clásica", False, None),                # sale (no viene en la alterna)
+        f("0000000006", "BO", "3 Plata", "Clásica", False, None),                # alterna lo trae "Por definir"
+        f("0000000007", "MM", "3 Plata", "Clásica", True, "2 Bronce"),           # alterna trae BO; transaccional cambia
+        f("0000000008", "Sin Asignar", "Por definir", "Por definir", None, None),  # alterna lo trae como BO
+    ])
 
 
 def _nuevo_calculado():
-    return pd.DataFrame({
-        "periodo": pd.Timestamp("2026-06-01"),
-        "cod_interlocutor": ["0000000001", "0000000002", "0000000003", "0000000004"],
-        "cod_boca_salida": ["BO", "BO", "PA", "GA"],
-        "des_segmento_transaccional": ["1 Oro+", "2 Oro", "2 Oro", "1 Oro+"],
-        "des_segmento_estrategica": ["Clásica", "Estrella", "Estadio 1", "Chifa"],
-        "flg_encuesta": [True, True, True, True], "flg_mercado_potencial": [False, False, False, False],
-        "flg_potential": [True, True, False, True], "des_potencial_predic": ["2 Bronce", "1 Plata - Oro - Oro+", None, "2 Bronce"],
-        "des_oficina_venta": ["Lima", "Callao", "Norte", "Sur"], "fec_proceso": pd.Timestamp("2026-06-30"),
-    })
+    """La alterna de 2026-06-01 (ya pasada por `aplicar_reglas_negocio`), con las bocas en vs2."""
+    f = lambda *a, **k: _fila(*a, periodo="2026-06-01", fec="2026-06-30", **k)  # noqa: E731
+    return pd.DataFrame([
+        f("0000000001", "BO", "1 Oro+", "Estrella", True, "1 Plata - Oro - Oro+"),
+        f("0000000002", "BO", "2 Oro", "Estrella", True, "1 Plata - Oro - Oro+"),
+        f("0000000003", "PA", "2 Oro", "Estadio 2", True, "High"),
+        f("0000000004", "PM", "2 Oro", "Abarrotero", True, "High", oficina="Sur"),
+        f("0000000006", "BO", "Por definir", "Por definir", None, None),
+        f("0000000007", "BO", "2 Oro", "Estrella", True, "1 Plata - Oro - Oro+"),
+        f("0000000008", "BO", "2 Oro", "Clásica", True, "2 Bronce"),
+        f("0000000009", "GA", "1 Oro+", "Chifa", True, "2 Bronce"),               # nuevo
+        f("0000000010", "BO", "Por definir", "Por definir", None, None),          # nuevo "Por definir"
+    ])
 
 
-def test_filtrar_incremental_agrega_clientes_nuevos():
-    out = filtrar_incremental(_nuevo_calculado(), _gold_base())
-    assert "0000000004" in out["cod_interlocutor"].values
+def _inc():
+    return completar_incremental(_nuevo_calculado(), _gold_base()).set_index("cod_interlocutor")
 
 
-def test_filtrar_incremental_devuelve_toda_la_tabla_mas_los_nuevos():
-    """Opción B: la salida siempre trae TODOS los clientes de gold + los nuevos (no solo un delta)."""
-    out = filtrar_incremental(_nuevo_calculado(), _gold_base())
-    assert set(out["cod_interlocutor"]) == {"0000000001", "0000000002", "0000000003", "0000000004"}
+def test_grupo_boca_colapsa_bo_mm_ab_go_y_sin_asignar():
+    out = grupo_boca(pd.Series(["BO", "mm", " AB ", "GO", "Sin Asignar", "PM", "PA", None]))
+    assert out.tolist()[:7] == ["BO", "BO", "BO", "BO", "BO", "PM", "PA"] and pd.isna(out.iloc[7])
 
 
-def test_filtrar_incremental_completa_solo_lo_vacio():
-    out = filtrar_incremental(_nuevo_calculado(), _gold_base()).set_index("cod_interlocutor")
-    # cliente 2: no tenía des_segmento_estrategica ni flg_potential/des_potencial_predic -> se completan
-    fila2 = out.loc["0000000002"]
-    assert fila2["des_segmento_estrategica"] == "Estrella"
-    assert fila2["flg_potential"] == True and fila2["des_potencial_predic"] == "1 Plata - Oro - Oro+"  # noqa: E712
-    # cliente 1: ya tenía todo -> se conserva igual (no se pisa con el valor "nuevo" recalculado)
-    assert out.loc["0000000001", "des_segmento_estrategica"] == "Clásica"
-    assert out.loc["0000000001", "flg_potential"] == True  # noqa: E712
+def test_incremental_agrega_nuevos_y_no_arrastra_a_quien_no_viene_en_la_alterna():
+    out = _inc()
+    assert {"0000000009", "0000000010"} <= set(out.index)
+    assert "0000000005" not in out.index                      # salió: no se arrastra su fila
+    assert set(out.index) == set(_nuevo_calculado()["cod_interlocutor"])
 
 
-def test_filtrar_incremental_nunca_cambia_boca_salida_de_existentes():
-    """cod_boca_salida de un cliente existente sale siempre de gold, nunca del cálculo
-    fresco (acá con boca coincidente, para que el cliente sí reciba un relleno)."""
-    out = filtrar_incremental(_nuevo_calculado(), _gold_base()).set_index("cod_interlocutor")
-    assert out.loc["0000000002", "cod_boca_salida"] == "BO"
+def test_incremental_nuevo_por_definir_queda_sin_estrategica_ni_potencial():
+    fila = _inc().loc["0000000010"]
+    assert fila["des_segmento_estrategica"] == "Por definir"
+    assert pd.isna(fila["flg_potential"]) and pd.isna(fila["des_potencial_predic"])
 
 
-def test_filtrar_incremental_emparejamiento_por_boca_salida():
-    """Si el cálculo fresco trae al cliente con otra boca, no se rellena nada para ese
-    cliente (queda como estaba en gold, incompleto): la boca de gold no cambia, y el valor
-    fresco fue calculado para una boca distinta — mezclarlos crearía una combinación
-    inconsistente."""
-    nuevo = _nuevo_calculado()
-    nuevo.loc[nuevo["cod_interlocutor"] == "0000000002", "cod_boca_salida"] = "AB"
-    out = filtrar_incremental(nuevo, _gold_base()).set_index("cod_interlocutor")
-    assert pd.isna(out.loc["0000000002", "des_segmento_estrategica"])   # sigue como en gold: sin dato
-    assert pd.isna(out.loc["0000000002", "flg_potential"])
-    assert out.loc["0000000002", "cod_boca_salida"] == "BO"
+def test_incremental_conserva_estrategica_y_potencial_de_quien_ya_tenia_segmento():
+    fila = _inc().loc["0000000001"]
+    assert fila["des_segmento_estrategica"] == "Clásica"          # la alterna decía "Estrella"
+    assert fila["flg_potential"] == True and fila["des_potencial_predic"] == "2 Bronce"  # noqa: E712
 
 
-def test_filtrar_incremental_nunca_produce_combinacion_invalida_en_filas_completadas():
-    """Toda fila que SÍ quedó con segmento asignado (no NaN) es una combinación válida.
-    Una fila que sigue incompleta (nunca se pudo rellenar) puede seguir "sin asignar" —
-    eso no es una combinación inválida nueva, es la misma incompletitud que ya traía gold."""
-    from src.segmentacion_gold import validar_combinaciones
-
-    nuevo = _nuevo_calculado()
-    nuevo.loc[nuevo["cod_interlocutor"] == "0000000002", "cod_boca_salida"] = "AB"
-    out = filtrar_incremental(nuevo, _gold_base())
-    con_segmento = out[out["des_segmento_estrategica"].notna()]
-    assert validar_combinaciones(con_segmento).empty
+def test_incremental_conserva_potencial_false_aunque_el_fresco_diga_otra_cosa():
+    fila = _inc().loc["0000000003"]
+    assert fila["flg_potential"] == False and pd.isna(fila["des_potencial_predic"])  # noqa: E712
+    assert fila["des_segmento_estrategica"] == "Estadio 1"
 
 
-def test_filtrar_incremental_periodo_y_fec_proceso_de_toda_la_tabla():
-    """Opción B: periodo/fec_proceso se pisan en TODA la tabla, incluidos los clientes que
-    ya tenían todo completo (no solo en los que recibieron un dato nuevo)."""
-    out = filtrar_incremental(_nuevo_calculado(), _gold_base())
+def test_incremental_completa_lo_que_estaba_por_definir_y_conserva_ab_de_gold():
+    fila = _inc().loc["0000000002"]
+    assert fila["des_segmento_transaccional"] == "2 Oro"
+    assert fila["des_segmento_estrategica"] == "Estrella"
+    assert fila["flg_potential"] == True and fila["des_potencial_predic"] == "1 Plata - Oro - Oro+"  # noqa: E712
+    assert fila["cod_boca_salida"] == "AB"                         # la alterna colapsa AB -> BO
+
+
+def test_incremental_el_transaccional_lo_manda_la_alterna():
+    fila = _inc().loc["0000000007"]
+    assert fila["des_segmento_transaccional"] == "2 Oro"          # gold tenía "3 Plata"
+    assert fila["cod_boca_salida"] == "MM"                         # misma boca en vs2: se conserva MM
+    assert fila["des_segmento_estrategica"] == "Clásica" and fila["des_potencial_predic"] == "2 Bronce"
+
+
+def test_incremental_cambio_de_grupo_de_boca_toma_todo_lo_fresco():
+    fila = _inc().loc["0000000004"]
+    assert fila["cod_boca_salida"] == "PM"
+    assert fila["des_segmento_transaccional"] == "2 Oro"
+    assert fila["des_segmento_estrategica"] == "Abarrotero"
+    assert fila["flg_potential"] == True and fila["des_potencial_predic"] == "High"  # noqa: E712
+    assert fila["des_oficina_venta"] == "Sur"
+
+
+def test_incremental_no_conserva_la_boca_de_gold_si_no_es_granular():
+    """'Sin Asignar' en gold no se conserva: si la alterna ya trae una boca, esa es la boca."""
+    assert _inc().loc["0000000008", "cod_boca_salida"] == "BO"
+
+
+def test_incremental_un_cliente_con_segmento_no_regresa_a_por_definir():
+    fila = _inc().loc["0000000006"]
+    assert fila["des_segmento_transaccional"] == "3 Plata"
+    assert fila["des_segmento_estrategica"] == "Clásica"
+    assert fila["flg_potential"] == False                           # noqa: E712
+
+
+def test_incremental_periodo_y_fec_proceso_son_los_de_la_alterna():
+    out = _inc()
     assert (out["periodo"] == pd.Timestamp("2026-06-01")).all()
     assert (out["fec_proceso"] == pd.Timestamp("2026-06-30")).all()
-    # incluido el cliente 1, que en gold tenía periodo 2026-05-01 y ya estaba completo
-    assert out.set_index("cod_interlocutor").loc["0000000001", "periodo"] == pd.Timestamp("2026-06-01")
 
 
-def test_filtrar_incremental_no_pisa_datos_ya_existentes_con_el_recalculo():
-    """Aunque el cálculo fresco traiga un valor distinto para un cliente que ya tenía datos,
-    se conserva el de gold — el modo incremental solo rellena huecos, nunca reemplaza."""
-    nuevo = _nuevo_calculado()
-    nuevo.loc[nuevo["cod_interlocutor"] == "0000000001", "des_segmento_estrategica"] = "Estrella"  # distinto a gold ("Clásica")
-    out = filtrar_incremental(nuevo, _gold_base()).set_index("cod_interlocutor")
-    assert out.loc["0000000001", "des_segmento_estrategica"] == "Clásica"   # el de gold, no "Estrella"
+def test_incremental_devuelve_las_columnas_de_gold_y_no_muta_las_entradas():
+    nuevo, gold = _nuevo_calculado(), _gold_base()
+    nuevo0, gold0 = nuevo.copy(), gold.copy()
+    out = completar_incremental(nuevo, gold)
+    assert list(out.columns) == COLUMNAS_GOLD
+    pd.testing.assert_frame_equal(nuevo, nuevo0)
+    pd.testing.assert_frame_equal(gold, gold0)
 
 
-def test_filtrar_incremental_valida_columnas():
+def test_incremental_potencial_false_nunca_tiene_etiqueta():
+    out = _inc()
+    assert out.loc[out["flg_potential"].eq(False).fillna(False).astype(bool), "des_potencial_predic"].isna().all()
+
+
+def test_incremental_valida_columnas():
     with pytest.raises(KeyError, match="Faltan columnas"):
-        filtrar_incremental(_nuevo_calculado(), pd.DataFrame({"x": [1]}))
+        completar_incremental(_nuevo_calculado(), pd.DataFrame({"cod_interlocutor": ["1"]}))
 
 
-def test_preparar_para_upsert_modos():
+def test_incremental_una_boca_explicita_ab_o_mm_en_la_alterna_manda():
+    """Si el trax algún día emite AB/MM explícitos, esa boca reemplaza a la de gold."""
     nuevo = _nuevo_calculado()
-    assert len(preparar_para_upsert(nuevo, "completo")) == len(nuevo)
-    out_inc = preparar_para_upsert(nuevo, "incremental", df_gold_actual=_gold_base())
-    assert len(out_inc) == 4   # 3 de gold (conservados/completados) + 1 nuevo
-    with pytest.raises(ValueError, match="necesita df_gold_actual"):
-        preparar_para_upsert(nuevo, "incremental")
+    nuevo.loc[nuevo["cod_interlocutor"] == "0000000007", "cod_boca_salida"] = "AB"
+    assert completar_incremental(nuevo, _gold_base()).set_index("cod_interlocutor").loc["0000000007", "cod_boca_salida"] == "AB"
+
+
+# ---------------------------------------------------------------- salidas, regresiones y validación
+def test_detectar_salidas():
+    salidas = detectar_salidas(_nuevo_calculado(), _gold_base())
+    assert salidas["cod_interlocutor"].tolist() == ["0000000005"]
+
+
+def test_clasificar_salidas_separa_las_esperadas_de_las_que_hay_que_revisar():
+    salidas = pd.DataFrame({"cod_interlocutor": ["0000000005", "0000000011", "0000000012"],
+                            "cod_boca_salida": ["BO"] * 3, "des_segmento_transaccional": ["2 Oro"] * 3})
+    hist = pd.DataFrame({"cod_cliente_dex": [5, 11], "cod_grupo_precio_dex": ["ot", "BO"]})
+    out = clasificar_salidas(salidas, hist).set_index("cod_interlocutor")
+    assert out["motivo"].to_dict() == {"0000000005": "no_segmentable", "0000000011": "segmentable",
+                                       "0000000012": "sin_historico"}
+    assert out["esperada"].to_dict() == {"0000000005": True, "0000000011": False, "0000000012": False}
+
+
+def test_detectar_regresiones():
+    reg = detectar_regresiones(_nuevo_calculado(), _gold_base())
+    assert reg["cod_interlocutor"].tolist() == ["0000000006"]
+    assert reg["des_segmento_transaccional_ant"].tolist() == ["3 Plata"]
+
+
+def test_validar_incremental_cuenta_cada_grupo():
+    salidas = clasificar_salidas(
+        detectar_salidas(_nuevo_calculado(), _gold_base()),
+        pd.DataFrame({"cod_cliente_dex": [5], "cod_grupo_precio_dex": ["MA"]}),
+    )
+    v = validar_incremental(_nuevo_calculado(), _gold_base(), salidas)
+    assert v == {
+        "clientes_periodo_anterior": 8, "clientes_periodo_actual": 9, "nuevos": 2, "salidas": 1,
+        "salidas_esperadas": 1, "salidas_a_revisar": 0,
+        "cambio_grupo_boca": 1,            # 4: BO -> PM
+        "boca_granular_conservada": 2,     # 2 (AB) y 7 (MM)
+        "por_definir_resueltos": 2,        # 2 y 8 (8: "Sin Asignar" -> BO es el mismo grupo)
+        "siguen_por_definir": 0,
+        "conservados": 4,                  # 1, 3, 6 y 7
+        "transaccional_cambia": 1,         # 7: "3 Plata" -> "2 Oro"
+        "regresan_a_por_definir": 1,       # 6
+    }
+
+
+def test_validar_incremental_sin_clasificar_salidas_no_incluye_esos_campos():
+    v = validar_incremental(_nuevo_calculado(), _gold_base())
+    assert "salidas_esperadas" not in v and v["salidas"] == 1
+
+
+# ---------------------------------------------------------------- modos y carga
+def test_preparar_carga_periodo_modos():
+    nuevo = _nuevo_calculado()
+    assert len(preparar_carga_periodo(nuevo, "completo")) == len(nuevo)
+    out_inc = preparar_carga_periodo(nuevo, "incremental", gold_periodo_anterior=_gold_base())
+    assert len(out_inc) == len(nuevo)                              # nadie se arrastra; solo la alterna
+    with pytest.raises(ValueError, match="necesita gold_periodo_anterior"):
+        preparar_carga_periodo(nuevo, "incremental")
     with pytest.raises(ValueError, match="modo debe ser"):
-        preparar_para_upsert(nuevo, "otro")
-
-# ---------------------------------------------------------------- MERGE SQL
-def test_build_merge_query_contiene_las_clausulas():
-    sql = build_merge_query("proyecto.dev.staging", "proyecto.gold.tabla")
-    assert "MERGE `proyecto.gold.tabla`" in sql
-    assert "USING `proyecto.dev.staging`" in sql
-    assert "ON destino.cod_interlocutor = nuevo.cod_interlocutor" in sql
-    assert "WHEN MATCHED THEN" in sql and "WHEN NOT MATCHED THEN" in sql
-    assert "INSERT (periodo, cod_interlocutor" in sql
-    assert "cod_interlocutor = nuevo.cod_interlocutor" not in sql.split("UPDATE SET")[1].split("WHEN NOT")[0]
+        preparar_carga_periodo(nuevo, "otro")
 
 
-# ---------------------------------------------------------------- upsert_gold
-def test_upsert_gold_convierte_periodo_y_fec_proceso_a_date(monkeypatch):
-    """BigQuery rechaza DATETIME en una columna DATE: periodo/fec_proceso deben llegar a
-    to_gbq como datetime.date, no como pd.Timestamp."""
-    import datetime
-    import sys
-    import types
+def test_construir_insert_gold_es_un_insert_select_sin_merge():
+    sql = construir_insert_gold("proyecto.gold.tabla", "proyecto.dev.staging")
+    assert sql.startswith("INSERT INTO `proyecto.gold.tabla`") and "FROM `proyecto.dev.staging`" in sql
+    assert "MERGE" not in sql and "CAST(periodo AS DATE) AS periodo" in sql
 
-    from src.segmentacion_gold import upsert_gold
 
-    capturado = {}
+class _ClienteFalso:
+    def __init__(self, filas_en_periodo):
+        self.filas = filas_en_periodo
 
-    def fake_to_gbq(df, destination_table, project_id, if_exists):
-        capturado["df"] = df.copy()
+    def query(self, sql):
+        class _R:
+            def __init__(s, n): s.n = n
+            def to_dataframe(s): return pd.DataFrame({"n": [s.n]})
+        return _R(self.filas)
 
-    fake_module = types.ModuleType("pandas_gbq")
-    fake_module.to_gbq = fake_to_gbq
-    monkeypatch.setitem(sys.modules, "pandas_gbq", fake_module)
 
-    class FakeQueryResult:
-        def result(self):
-            return None
+def test_cargar_periodo_gold_se_niega_si_el_periodo_ya_esta_cargado():
+    with pytest.raises(ValueError, match="Ya existe al menos una fila"):
+        cargar_periodo_gold(_nuevo_calculado(), _ClienteFalso(5), "p.d.gold", "p.d.staging")
 
-    class FakeClient:
-        def query(self, sql):
-            return FakeQueryResult()
 
-    df = _nuevo_calculado()  # ya tiene periodo/fec_proceso como pd.Timestamp
-    upsert_gold(df, FakeClient(), "proyecto.dev.staging", "proyecto.gold.tabla", "proyecto")
-
-    subido = capturado["df"]
-    assert all(isinstance(v, datetime.date) and not isinstance(v, datetime.datetime) for v in subido["periodo"])
-    assert all(isinstance(v, datetime.date) and not isinstance(v, datetime.datetime) for v in subido["fec_proceso"])
-    assert list(subido.columns) == COLUMNAS_GOLD
+def test_cargar_periodo_gold_se_niega_con_mas_de_un_periodo():
+    df = pd.concat([_nuevo_calculado(), _gold_base()], ignore_index=True)
+    with pytest.raises(ValueError, match="un solo periodo"):
+        cargar_periodo_gold(df, _ClienteFalso(0), "p.d.gold", "p.d.staging")

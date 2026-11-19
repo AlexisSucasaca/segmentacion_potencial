@@ -24,7 +24,7 @@ etapa, una config por vertical y dos notebooks orquestadores.
                       clasificación No Potencial/Low/Medium/High por cliente
     src/segmentacion_gold.py  tabla final de segmentación (transaccional + estratégica +
                       potencial) para la capa gold de BigQuery, en modo completo o
-                      incremental, con MERGE (nunca duplica cod_interlocutor)
+                      incremental, con INSERT de un periodo nuevo (clave: cod_interlocutor + periodo)
     src/salidas.py     encuentra el Excel más reciente de cada vertical por nombre de
                       archivo, para no escribirlos a mano en segmentacion_gold.ipynb
 
@@ -38,7 +38,7 @@ etapa, una config por vertical y dos notebooks orquestadores.
                                     después de orquestador_pm.ipynb)
     notebooks/segmentacion_gold.ipynb  arma la tabla de segmentación gold (transaccional +
                                     estratégica + potencial), modo completo o incremental,
-                                    y hace el MERGE — corre después de las 6 verticales
+                                    y hace el INSERT — corre después de las 6 verticales
 
     tests/            133 tests: unitarios, contra los 6 Excel de referencia (2026-08-31) y
                       de equivalencia con el código original (tests/legacy/)
@@ -95,26 +95,40 @@ sí da 100%.
 ## Tabla de segmentación gold (`segmentacion_gold.py`)
 
 Reemplaza a `notebook.ipynb` (el que unía las 3 segmentaciones — transaccional, estratégica
-y potencial — y cargaba a la capa gold). Dos cambios deliberados frente al original:
+y potencial — y cargaba a la capa gold). La clave de la tabla es (`cod_interlocutor`,
+`periodo`): es un **historial** con una fila por cliente y periodo cargado. Cambios
+deliberados frente al original:
 
-- **`MERGE` en vez de `INSERT INTO`**: el notebook original solo insertaba filas, sin
-  revisar si el cliente ya existía — esa es la causa más probable de los duplicados en la
-  tabla gold. El `MERGE` empareja por `cod_interlocutor` y nunca puede duplicar.
+- **`INSERT` de un periodo nuevo**: nunca se toca un periodo que ya existe. Si `PERIODO` ya
+  tiene filas en gold, el notebook se detiene; recargarlo exige borrarlo antes, a mano. No hay
+  `MERGE`: con la clave (cliente, periodo), un periodo nuevo no puede chocar con filas existentes.
 - **Sin el parche puntual** que el notebook original tenía para un cliente específico
-  (`drop_duplicates` hardcodeado a un id): ya no hace falta, el `MERGE` lo hace innecesario.
+  (`drop_duplicates` hardcodeado a un id): `aplicar_reglas_negocio` deduplica por cliente de
+  forma genérica.
+
+La boca de salida y el transaccional salen de la tabla alterna del trax
+(`seg_tabla_alterna_estrategica_transaccional`, repo `segmentacion_trax`); el potencial, de los
+Excel de las verticales.
 
 Dos modos:
-- **`completo`**: recalcula y reemplaza las 3 segmentaciones para todo el universo.
-- **`incremental`**: agrega clientes nuevos y completa, en los que ya existen, la
-  segmentación que les faltaba — nunca toca `cod_boca_salida` ni reemplaza un dato que ya
-  existía, aunque el recálculo dé otro valor. `periodo`/`fec_proceso` se pisan en TODA la
-  tabla en cada corrida (incluidos los clientes sin ningún dato nuevo), así que cada corrida
-  incremental sube al `MERGE` la tabla completa, no solo la diferencia. La tabla solo crece
-  entre corridas incrementales; una corrida `completo` es la única que puede "resetear" el
-  universo de clientes.
+- **`completo`**: se inserta el cálculo fresco de cada cliente, sin mirar el historial.
+- **`incremental`**: la base es el gold del periodo inmediatamente anterior y la alterna del trax
+  es la autoridad para la boca y el transaccional:
+  - **Nuevos**: se agregan tal cual.
+  - **Salidas**: el cliente que estaba en gold y ya no viene en la alterna **sale** (no se
+    arrastra). El notebook clasifica cada salida por su boca histórica y se detiene si alguna no
+    es de una boca no segmentable (MA, FA, PI, OT), hasta que se ponga `SALIDAS_REVISADAS = True`.
+  - **Cambio de grupo de boca** (se compara en vs2: BO, MM y AB cuentan como una, porque así las
+    emite el trax): boca, transaccional, estratégica y potencial son los frescos.
+  - **Mismo grupo de boca**: se conserva el `AB`/`MM` de gold si la alterna dice `BO`; el
+    transaccional es el de la alterna; estratégica y potencial solo cambian si estaban "Por
+    definir" (si ya tenían segmento se conservan, incluido `flg_potential = False`). Un cliente
+    con segmento que la alterna trae "Por definir" no regresa: conserva su fila anterior y se
+    lista para revisarlo.
 
-En los dos modos, `periodo` y `fec_proceso` (el último día del mes de `periodo`) se
-escriben en toda la tabla resultante, representando la fecha de la corrida más reciente.
+En los dos modos, `periodo` y `fec_proceso` (el último día del mes de `periodo`) son los del
+cálculo del periodo, y se aplica al final el invariante `flg_potential = False` ⇒
+`des_potencial_predic = NULL`.
 
 ## Métricas de cada corrida (modelo de referencia)
 

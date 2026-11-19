@@ -44,20 +44,22 @@ completo
 
 incremental
     La base es el gold del periodo INMEDIATAMENTE anterior (no se busca más atrás). El
-    emparejamiento es SOLO por `cod_interlocutor`; el cálculo fresco de este periodo aporta
-    únicamente lo que el periodo anterior no tenía resuelto:
+    emparejamiento es SOLO por `cod_interlocutor`. La alterna del trax (`df_final`) es la
+    autoridad para la boca de salida y el transaccional; para la estratégica y el potencial solo
+    aporta lo que el periodo anterior no tenía resuelto:
 
-    - Cliente del periodo anterior que hoy no viene en el cálculo fresco: se arrastra su fila
-      anterior (nadie sale).
-    - Cliente NUEVO (su código no estaba): se agrega con el cálculo fresco. Si su transaccional
-      es "Por definir", queda sin estratégica ("Por definir") ni potencial (NULL).
-    - Cliente que ya estaba pero con OTRA boca: se desestima el cálculo fresco y conserva su
-      fila anterior (boca, transaccional, estratégica y potencial).
-    - Cliente que ya estaba con la misma boca: solo cambia lo que estaba "Por definir". Si ya
-      tenía segmento, se conservan transaccional, estratégica y potencial (incluido
-      `flg_potential = False`), aunque el cálculo fresco diga otra cosa: nunca regresa a "Por
-      definir". Si estaba "Por definir" y hoy tiene segmento, toma los valores frescos (es el
-      único caso en que cambia la potencialidad); si sigue "Por definir", se queda así.
+    - Cliente NUEVO (su código no estaba): se agrega tal cual. Si su transaccional es "Por
+      definir", queda sin estratégica ("Por definir") ni potencial (NULL).
+    - Cliente del periodo anterior que hoy no viene en la alterna: SALE de gold (no se arrastra).
+      El notebook clasifica cada salida por su boca histórica y se detiene si alguna no es de una
+      boca no segmentable (MA, FA, PI, OT).
+    - Cliente que cambió de GRUPO de boca (se compara en vs2: BO/MM/AB cuentan como una sola, que es
+      como las emite el trax): boca, transaccional, estratégica y potencial son los frescos.
+    - Cliente con el mismo grupo de boca: la boca de gold (AB o MM) se conserva si la alterna dice
+      BO; el transaccional es el de la alterna (salvo que regrese a "Por definir": se conserva el
+      de gold y se reporta); estratégica y potencial solo cambian si estaban "Por definir" (o el
+      `flg_potential` anterior era NULL); si ya tenían segmento se conservan, incluido
+      `flg_potential = False`.
 
     `validar_incremental` cuenta cada uno de estos grupos para revisarlo antes de insertar.
 
@@ -402,10 +404,43 @@ def _cruzar_con_anterior(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataF
     return out
 
 
-def _boca_distinta(cruce: pd.DataFrame) -> pd.Series:
-    """El cliente estaba en el periodo anterior pero con otra `cod_boca_salida`."""
-    misma = cruce["cod_boca_salida"].fillna("") == cruce["cod_boca_salida_ant"].fillna("")
-    return cruce["_en_anterior"] & ~misma
+# Bocas que el trax colapsa a "BO" (grupo vs2). La alterna puede traer `BO` para un cliente que en
+# gold está como `AB` o `MM`; para decidir si "cambió de boca" se compara el GRUPO, no el texto.
+_GRUPO_BO = {"BO", "MM", "AB", "GO", "SIN ASIGNAR"}
+BOCAS_GRANULARES = ("AB", "MM")
+# Bocas fuera de la segmentación: un cliente cuya boca histórica es una de estas SALE de gold.
+BOCAS_NO_SEGMENTABLES = ("MA", "FA", "PI", "OT")
+
+
+def grupo_boca(serie: pd.Series) -> pd.Series:
+    """La boca llevada a su grupo vs2: `BO`, `MM`, `AB`, `GO` y `Sin asignar` -> `BO`; el resto igual."""
+    t = serie.astype("string").str.strip().str.upper()
+    return t.where(~t.isin(_GRUPO_BO), "BO")
+
+
+def _bool(serie: pd.Series) -> pd.Series:
+    return serie.fillna(False).astype(bool)
+
+
+def _boca_cambio_grupo(cruce: pd.DataFrame) -> pd.Series:
+    """El cliente estaba en el periodo anterior pero su boca hoy es de OTRO grupo vs2.
+
+    `AB` -> `BO` no cuenta (mismo grupo: la alterna colapsa esas bocas); `BO` -> `PM` sí.
+    """
+    hoy = grupo_boca(cruce["cod_boca_salida"]).fillna("")
+    antes = grupo_boca(cruce["cod_boca_salida_ant"]).fillna("")
+    return cruce["_en_anterior"] & _bool(hoy != antes)
+
+
+def _boca_granular_conservada(cruce: pd.DataFrame, cambio_grupo: pd.Series) -> pd.Series:
+    """Clientes del mismo grupo a los que se les conserva la boca de gold (`AB` o `MM`).
+
+    La alterna trae `BO` y no distingue `AB`/`MM`: si hoy dice `BO` y gold tenía `AB` o `MM`, se
+    queda la de gold. Si la alterna trajera `AB` o `MM` explícitos, mandan ellos.
+    """
+    hoy = cruce["cod_boca_salida"].astype("string").str.strip().str.upper()
+    antes = cruce["cod_boca_salida_ant"].astype("string").str.strip().str.upper()
+    return cruce["_en_anterior"] & ~cambio_grupo & _bool(hoy.eq("BO")) & _bool(antes.isin(BOCAS_GRANULARES))
 
 
 def _estaba_por_definir(cruce: pd.DataFrame) -> pd.Series:
@@ -414,41 +449,48 @@ def _estaba_por_definir(cruce: pd.DataFrame) -> pd.Series:
             | _es_pendiente(cruce["des_segmento_estrategica_ant"]))
 
 
+def _regresa_a_por_definir(cruce: pd.DataFrame, cambio_grupo: pd.Series) -> pd.Series:
+    """Tenía transaccional en gold, misma boca (grupo) y la alterna hoy lo trae 'Por definir'."""
+    return (cruce["_en_anterior"] & ~cambio_grupo
+            & ~_es_pendiente(cruce["des_segmento_transaccional_ant"])
+            & _es_pendiente(cruce["des_segmento_transaccional"]))
+
+
 def completar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> pd.DataFrame:
     """Modo incremental: la base es el gold del periodo INMEDIATAMENTE anterior (no se busca
-    más atrás) y `df_final` (cálculo fresco de este periodo, ya con `aplicar_reglas_negocio`)
-    solo aporta lo que el periodo anterior no tenía resuelto.
+    más atrás) y `df_final` (la alterna de este periodo, ya con `aplicar_reglas_negocio`) es la
+    autoridad para la boca y el transaccional. Para la estratégica y el potencial solo aporta lo
+    que el periodo anterior no tenía resuelto. El emparejamiento es SOLO por `cod_interlocutor`:
 
-    Nadie sale: devuelve una fila por cada cliente de `df_final` MÁS una fila por cada cliente
-    del periodo anterior que hoy no viene en el cálculo fresco (ver abajo). El emparejamiento
-    es SOLO por `cod_interlocutor`:
-
-    - **Cliente del periodo anterior que no está en `df_final`**: se arrastra su fila anterior
-      tal cual (boca, segmentos, potencial y demás columnas), con el `periodo` y el
-      `fec_proceso` de este periodo.
-
-    - **Cliente nuevo** (su código no estaba en el periodo anterior): se agrega con el cálculo
-      fresco. Si su transaccional es "Por definir", queda sin segmento estratégico ("Por
-      definir") ni potencial (`flg_potential` y `des_potencial_predic` NULL), en todas las bocas.
-    - **Cliente que ya estaba pero con otra `cod_boca_salida`**: se desestima el cálculo fresco;
-      conserva la boca, la transaccional, la estratégica y el potencial del periodo anterior.
-    - **Cliente que ya estaba con la misma boca**: solo cambia lo que estaba "Por definir":
-        - `des_segmento_transaccional`: fresca si la anterior era "Por definir"/vacía; si ya
-          tenía segmento, se conserva la anterior (aunque la fresca diga otro segmento).
-        - `des_segmento_estrategica`: ídem, según la estratégica anterior.
+    - **Cliente nuevo** (su código no estaba en el periodo anterior): se agrega tal cual. Si su
+      transaccional es "Por definir", queda sin segmento estratégico ("Por definir") ni potencial
+      (`flg_potential` y `des_potencial_predic` NULL), en todas las bocas.
+    - **Cliente del periodo anterior que no viene en `df_final`: SALE.** No se arrastra. Quién
+      sale y por qué lo revisa el notebook antes de insertar (`detectar_salidas`,
+      `clasificar_salidas`).
+    - **Cambió de grupo de boca** (p. ej. `BO` -> `PM`, comparando en vs2): boca, transaccional,
+      estratégica y potencial son los frescos; el potencial anterior se calculó para otra vertical.
+    - **Mismo grupo de boca:**
+        - `cod_boca_salida`: si la alterna trae `BO` y gold tenía `AB` o `MM`, se conserva la
+          de gold (la alterna colapsa esas bocas). Cualquier otra boca es la de la alterna.
+        - `des_segmento_transaccional`: el de la alterna. Excepción: si el cliente tenía segmento
+          y la alterna lo trae "Por definir", se conserva el de gold (un cliente con segmento no
+          regresa a "Por definir"); `detectar_regresiones` los lista para revisarlos.
+        - `des_segmento_estrategica`: fresca solo si la anterior era "Por definir"/vacía.
         - `flg_potential` y `des_potencial_predic`: frescos si el cliente estaba "Por definir"
           (transaccional o estratégica) o su `flg_potential` anterior era NULL; si no, se
           conservan los anteriores, incluido `False`.
-      Un cliente con segmento nunca regresa a "Por definir".
     """
     cruce = _cruzar_con_anterior(df_final, gold_periodo_anterior)
     en_ant = cruce["_en_anterior"]
-    boca_distinta = _boca_distinta(cruce)
-    misma_boca = en_ant & ~boca_distinta
+    cambio_grupo = _boca_cambio_grupo(cruce)
+    misma = en_ant & ~cambio_grupo
 
     transac_ant_pend = _es_pendiente(cruce["des_segmento_transaccional_ant"])
     estrat_ant_pend = _es_pendiente(cruce["des_segmento_estrategica_ant"])
     potencial_ant_pend = transac_ant_pend | estrat_ant_pend | cruce["flg_potential_ant"].isna()
+    regresa = _regresa_a_por_definir(cruce, cambio_grupo)
+    granular = _boca_granular_conservada(cruce, cambio_grupo)
 
     out = cruce
     # Valor fresco: transaccional "Por definir" => sin estratégica ni potencial (todas las bocas).
@@ -461,74 +503,111 @@ def completar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.Data
     out.loc[fresco_pend, "des_potencial_predic"] = None
 
     for col, heredar in (
-        ("cod_boca_salida", boca_distinta),
-        ("des_segmento_transaccional", boca_distinta | (misma_boca & ~transac_ant_pend)),
-        ("des_segmento_estrategica", boca_distinta | (misma_boca & ~estrat_ant_pend)),
-        ("flg_potential", boca_distinta | (misma_boca & ~potencial_ant_pend)),
-        ("des_potencial_predic", boca_distinta | (misma_boca & ~potencial_ant_pend)),
+        ("cod_boca_salida", granular),
+        ("des_segmento_transaccional", regresa),
+        ("des_segmento_estrategica", misma & ~estrat_ant_pend),
+        ("flg_potential", misma & ~potencial_ant_pend),
+        ("des_potencial_predic", misma & ~potencial_ant_pend),
     ):
         out[col] = out[col].astype(object).where(~heredar, out[f"{col}_ant"].astype(object))
 
     out = out.drop(columns=[c for c in out.columns if c.endswith("_ant")] + ["_en_anterior"])
-
-    # Nadie sale: los clientes del periodo anterior que hoy no vienen en el cálculo fresco
-    # se arrastran con su fila anterior, solo con el periodo y la fecha de proceso de hoy.
-    faltan_ant = [c for c in COLUMNAS_GOLD if c not in gold_periodo_anterior.columns]
-    if faltan_ant:
-        raise KeyError(f"Faltan columnas en gold_periodo_anterior: {faltan_ant}")
-    ausentes = gold_periodo_anterior.loc[
-        ~gold_periodo_anterior["cod_interlocutor"].isin(out["cod_interlocutor"]), COLUMNAS_GOLD
-    ].drop_duplicates(subset=["cod_interlocutor"]).copy()
-    if not ausentes.empty:
-        ausentes["periodo"] = out["periodo"].iloc[0]
-        ausentes["fec_proceso"] = out["fec_proceso"].iloc[0]
-        out = pd.concat([out, ausentes[COLUMNAS_GOLD]], ignore_index=True)
-    return aplicar_invariante_potencial(out)
+    return aplicar_invariante_potencial(out[COLUMNAS_GOLD])
 
 
-def validar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> dict:
+def detectar_salidas(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> pd.DataFrame:
+    """Clientes del periodo anterior que hoy no vienen en la alterna: salen de gold."""
+    ausentes = ~gold_periodo_anterior["cod_interlocutor"].isin(df_final["cod_interlocutor"])
+    return (gold_periodo_anterior.loc[ausentes, ["cod_interlocutor", "cod_boca_salida", "des_segmento_transaccional"]]
+            .drop_duplicates(subset=["cod_interlocutor"]).reset_index(drop=True))
+
+
+def clasificar_salidas(salidas: pd.DataFrame, boca_historica: pd.DataFrame) -> pd.DataFrame:
+    """Agrega a cada salida su boca histórica y si la salida era esperada.
+
+    `boca_historica`: `cod_cliente_dex` y `cod_grupo_precio_dex` (la boca del cliente en el último
+    mes de la ventana). `motivo`: `no_segmentable` (boca en `BOCAS_NO_SEGMENTABLES`: salida
+    esperada), `segmentable` (su boca sí se segmenta: hay que revisarla) o `sin_historico` (no
+    aparece en el histórico: también se revisa). `esperada` es True solo para `no_segmentable`.
+    """
+    out = salidas.copy()
+    out["_dex"] = pd.to_numeric(out["cod_interlocutor"], errors="coerce").astype("Int64")
+    bh = boca_historica.copy()
+    bh["_dex"] = pd.to_numeric(bh["cod_cliente_dex"], errors="coerce").astype("Int64")
+    bh = bh.dropna(subset=["_dex"]).drop_duplicates(subset=["_dex"])[["_dex", "cod_grupo_precio_dex"]]
+    out = out.merge(bh, on="_dex", how="left").drop(columns="_dex")
+    out = out.rename(columns={"cod_grupo_precio_dex": "boca_historica"})
+    boca = out["boca_historica"].astype("string").str.strip().str.upper()
+    out["motivo"] = np.select([boca.isna(), boca.isin(BOCAS_NO_SEGMENTABLES)],
+                              ["sin_historico", "no_segmentable"], default="segmentable")
+    out["esperada"] = out["motivo"].eq("no_segmentable")
+    return out
+
+
+def detectar_regresiones(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> pd.DataFrame:
+    """Clientes con segmento en gold anterior que la alterna trae "Por definir" (mismo grupo de boca).
+
+    `completar_incremental` los deja con su fila anterior; esta lista es para revisarlos.
+    """
+    cruce = _cruzar_con_anterior(df_final, gold_periodo_anterior)
+    m = _regresa_a_por_definir(cruce, _boca_cambio_grupo(cruce))
+    return cruce.loc[m, ["cod_interlocutor", "cod_boca_salida", "des_segmento_transaccional",
+                         "des_segmento_transaccional_ant"]].reset_index(drop=True)
+
+
+def validar_incremental(
+    df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame, salidas_clasificadas: Optional[pd.DataFrame] = None,
+) -> dict:
     """Cuenta cada grupo del modo incremental, para revisar ANTES de insertar.
 
-    `df_final` es el cálculo fresco (salida de `aplicar_reglas_negocio`). Devuelve un dict:
+    `df_final` es la alterna de este periodo (salida de `aplicar_reglas_negocio`). Devuelve un dict:
 
     - `clientes_periodo_anterior`, `clientes_periodo_actual`
     - `nuevos`: su código no estaba en el periodo anterior (se agregan)
-    - `arrastrados`: estaban en el periodo anterior y hoy no vienen en el cálculo fresco; se
-      arrastra su fila anterior (nadie sale)
-    - `boca_distinta_desestimada`: estaban con otra boca; se desestima el cálculo fresco y
-      conservan su fila anterior
-    - `por_definir_resueltos`: estaban "Por definir" y hoy su transaccional tiene segmento
-      (cambian transaccional, estratégica y potencial)
+    - `salidas`: estaban en el periodo anterior y hoy no vienen en la alterna (salen de gold)
+    - `salidas_esperadas` / `salidas_a_revisar`: solo si se pasa `salidas_clasificadas`
+    - `cambio_grupo_boca`: cambiaron de grupo de boca (p. ej. BO -> PM); toman todo lo fresco
+    - `boca_granular_conservada`: misma boca en vs2; la alterna dice `BO` y se conserva `AB` o `MM` de gold
+    - `por_definir_resueltos`: estaban "Por definir" y hoy tienen segmento (mismo grupo de boca)
     - `siguen_por_definir`: estaban "Por definir" y hoy también
-    - `conservados`: tenían segmento y misma boca; se conserva todo lo anterior
-    - `cambios_ignorados`: de los conservados, cuántos traían una transaccional fresca distinta
-      (el cambio no se aplica; conviene revisarlos)
+    - `conservados`: tenían segmento y mismo grupo de boca
+    - `transaccional_cambia`: de los conservados, cuántos cambian de segmento transaccional
+      (la alterna manda; conviene comparar contra lo que esperas del trax)
+    - `regresan_a_por_definir`: tenían segmento y la alterna los trae "Por definir"; se conserva
+      su fila anterior (ver `detectar_regresiones`)
     """
     cruce = _cruzar_con_anterior(df_final, gold_periodo_anterior)
     en_ant = cruce["_en_anterior"]
-    boca_distinta = _boca_distinta(cruce)
-    misma_boca = en_ant & ~boca_distinta
+    cambio_grupo = _boca_cambio_grupo(cruce)
+    misma = en_ant & ~cambio_grupo
     pendiente = _estaba_por_definir(cruce)
     hoy_pendiente = _es_pendiente(cruce["des_segmento_transaccional"])
-    transac_ant_pend = _es_pendiente(cruce["des_segmento_transaccional_ant"])
-    conservado = misma_boca & ~pendiente
-    transac_distinta = (
+    conservado = misma & ~pendiente
+    transac_distinta = _bool(
         cruce["des_segmento_transaccional"].fillna("") != cruce["des_segmento_transaccional_ant"].fillna("")
     )
 
     ids_hoy = set(df_final["cod_interlocutor"])
     ids_ant = set(gold_periodo_anterior["cod_interlocutor"])
-    return {
+    res = {
         "clientes_periodo_anterior": len(ids_ant),
         "clientes_periodo_actual": len(ids_hoy),
         "nuevos": len(ids_hoy - ids_ant),
-        "arrastrados": len(ids_ant - ids_hoy),
-        "boca_distinta_desestimada": int(boca_distinta.sum()),
-        "por_definir_resueltos": int((misma_boca & pendiente & ~hoy_pendiente).sum()),
-        "siguen_por_definir": int((misma_boca & pendiente & hoy_pendiente).sum()),
-        "conservados": int(conservado.sum()),
-        "cambios_ignorados": int((conservado & ~transac_ant_pend & transac_distinta).sum()),
+        "salidas": len(ids_ant - ids_hoy),
     }
+    if salidas_clasificadas is not None:
+        res["salidas_esperadas"] = int(salidas_clasificadas["esperada"].sum())
+        res["salidas_a_revisar"] = int((~salidas_clasificadas["esperada"]).sum())
+    res.update({
+        "cambio_grupo_boca": int(cambio_grupo.sum()),
+        "boca_granular_conservada": int(_boca_granular_conservada(cruce, cambio_grupo).sum()),
+        "por_definir_resueltos": int((misma & pendiente & ~hoy_pendiente).sum()),
+        "siguen_por_definir": int((misma & pendiente & hoy_pendiente).sum()),
+        "conservados": int(conservado.sum()),
+        "transaccional_cambia": int((conservado & ~hoy_pendiente & transac_distinta).sum()),
+        "regresan_a_por_definir": int(_regresa_a_por_definir(cruce, cambio_grupo).sum()),
+    })
+    return res
 
 
 def resumen_universo(df_armado: pd.DataFrame, df_reglas: pd.DataFrame) -> dict:
