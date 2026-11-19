@@ -63,6 +63,11 @@ incremental
 
     `validar_incremental` cuenta cada uno de estos grupos para revisarlo antes de insertar.
 
+PA: para los clientes de boca `PA`, el segmento estratégico (Estadio 1 a 4) sale EXCLUSIVAMENTE de la
+tabla consolidada de estadios (`preparar_segmento_pa` + `aplicar_segmento_pa`): lo que traiga la alterna
+no cuenta. Un PA que no está en la tabla queda "Por definir" (en el incremental conserva su estadio de
+gold, si lo tenía). En el incremental, un PA de la tabla toma siempre el estadio de la tabla.
+
 En los dos modos se aplica siempre, al final, el invariante de negocio: si
 `flg_potential = False`, `des_potencial_predic` tiene que ser `NULL` (no puede haber una
 etiqueta de potencial para un cliente que no es potencial). Es un chequeo estructural, no
@@ -383,6 +388,67 @@ def aplicar_invariante_potencial(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------- PA: segmento estratégico exclusivo de una tabla
+ESTADIOS_PA = ("Estadio 1", "Estadio 2", "Estadio 3", "Estadio 4")
+_COLS_CLIENTE_PA = ("cod_interlocutor", "cod_cliente_dex", "id_interlocutor_origen", "external_store_id", "cod_cliente")
+_COLS_SEGMENTO_PA = ("des_segmento_estrategica", "des_segmento_estrategico", "segmento_estrategico",
+                     "segmento_estrategica", "estadio", "segmento")
+
+
+def _columna_pa(df: pd.DataFrame, candidatas: Sequence[str], que: str) -> str:
+    for c in candidatas:
+        if c in df.columns:
+            return c
+    raise KeyError(f"No encuentro la columna de {que} en la tabla de PA (busqué {list(candidatas)}). "
+                   f"Columnas disponibles: {list(df.columns)}. Pásala con col_cliente / col_segmento.")
+
+
+def preparar_segmento_pa(
+    df_pa: pd.DataFrame, col_cliente: Optional[str] = None, col_segmento: Optional[str] = None,
+) -> pd.DataFrame:
+    """La tabla consolidada de estadios de PA -> `cod_interlocutor` (10 dígitos) y `des_segmento_estrategica`.
+
+    Acepta el estadio como `Estadio 1`..`Estadio 4` (cualquier mayúscula) o como `1`..`4`. Lo que no se
+    pueda interpretar se descarta con un aviso. Un cliente con dos estadios distintos es un error: la
+    tabla debe traer uno por cliente.
+    """
+    col_cliente = col_cliente or _columna_pa(df_pa, _COLS_CLIENTE_PA, "cliente")
+    col_segmento = col_segmento or _columna_pa(df_pa, _COLS_SEGMENTO_PA, "segmento estratégico")
+    texto = df_pa[col_segmento].astype("string").str.strip().str.lower()
+    numero = texto.str.extract(r"^(?:estadio\s*)?([1-4])(?:\.0)?$")[0]
+    out = pd.DataFrame({
+        "cod_interlocutor": pd.to_numeric(df_pa[col_cliente], errors="coerce").astype("Int64").astype("string").str.zfill(10),
+        "des_segmento_estrategica": ("Estadio " + numero).astype(object),
+    })
+    validas = out["cod_interlocutor"].notna() & out["des_segmento_estrategica"].notna()
+    if (~validas).any():
+        warnings.warn(f"{int((~validas).sum()):,} filas de la tabla de PA se descartan: cliente o estadio no interpretable.",
+                      stacklevel=2)
+    out = out[validas].drop_duplicates().reset_index(drop=True)
+    conflictos = out["cod_interlocutor"].duplicated(keep=False)
+    if conflictos.any():
+        raise ValueError(f"{out.loc[conflictos, 'cod_interlocutor'].nunique():,} clientes de la tabla de PA tienen más de un "
+                         f"estadio (p. ej. {out.loc[conflictos, 'cod_interlocutor'].iloc[0]}). Debe haber uno por cliente.")
+    return out
+
+
+def aplicar_segmento_pa(df_final: pd.DataFrame, segmento_pa: pd.DataFrame) -> tuple:
+    """Para los clientes de boca `PA`, la estratégica sale EXCLUSIVAMENTE de la tabla de estadios.
+
+    Está en la tabla -> su estadio. No está -> "Por definir" (no se usa la estratégica de la alterna).
+    Las demás bocas no cambian. Devuelve `(df, resumen)`; `resumen` cuenta los clientes PA con y sin tabla.
+    """
+    df = df_final.copy()
+    es_pa = df["cod_boca_salida"] == "PA"
+    valor = df["cod_interlocutor"].map(segmento_pa.set_index("cod_interlocutor")["des_segmento_estrategica"])
+    en_tabla = es_pa & valor.notna()
+    df["des_segmento_estrategica"] = df["des_segmento_estrategica"].astype(object)
+    df.loc[en_tabla, "des_segmento_estrategica"] = valor[en_tabla]
+    df.loc[es_pa & ~en_tabla, "des_segmento_estrategica"] = POR_DEFINIR
+    return df, {"pa_clientes": int(es_pa.sum()), "pa_con_tabla": int(en_tabla.sum()),
+                "pa_sin_tabla": int((es_pa & ~en_tabla).sum())}
+
+
 def _cruzar_con_anterior(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> pd.DataFrame:
     """`df_final` + las columnas `*_ant` de la fila del cliente en el periodo anterior.
 
@@ -456,7 +522,16 @@ def _regresa_a_por_definir(cruce: pd.DataFrame, cambio_grupo: pd.Series) -> pd.S
             & _es_pendiente(cruce["des_segmento_transaccional"]))
 
 
-def completar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame) -> pd.DataFrame:
+def _pa_en_tabla(cruce: pd.DataFrame, segmento_pa: Optional[pd.DataFrame]) -> pd.Series:
+    """Clientes de boca PA que están en la tabla de estadios (False para todos si no hay tabla)."""
+    if segmento_pa is None:
+        return pd.Series(False, index=cruce.index)
+    return (cruce["cod_boca_salida"] == "PA") & cruce["cod_interlocutor"].isin(segmento_pa["cod_interlocutor"])
+
+
+def completar_incremental(
+    df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame, segmento_pa: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """Modo incremental: la base es el gold del periodo INMEDIATAMENTE anterior (no se busca
     más atrás) y `df_final` (la alterna de este periodo, ya con `aplicar_reglas_negocio`) es la
     autoridad para la boca y el transaccional. Para la estratégica y el potencial solo aporta lo
@@ -480,9 +555,15 @@ def completar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.Data
         - `flg_potential` y `des_potencial_predic`: frescos si el cliente estaba "Por definir"
           (transaccional o estratégica) o su `flg_potential` anterior era NULL; si no, se
           conservan los anteriores, incluido `False`.
+
+    `segmento_pa` (salida de `preparar_segmento_pa`, ya aplicada a `df_final` con
+    `aplicar_segmento_pa`): los clientes de boca `PA` que están en la tabla toman SIEMPRE su estadio
+    (no se conserva el de gold ni se pisa por un transaccional "Por definir"). Los PA que no están en
+    la tabla siguen la regla normal: conservan su estadio de gold, o quedan "Por definir".
     """
     cruce = _cruzar_con_anterior(df_final, gold_periodo_anterior)
     en_ant = cruce["_en_anterior"]
+    pa_tabla = _pa_en_tabla(cruce, segmento_pa)
     cambio_grupo = _boca_cambio_grupo(cruce)
     misma = en_ant & ~cambio_grupo
 
@@ -498,14 +579,14 @@ def completar_incremental(df_final: pd.DataFrame, gold_periodo_anterior: pd.Data
     out["des_segmento_estrategica"] = out["des_segmento_estrategica"].astype(object)
     out["flg_potential"] = out["flg_potential"].astype(object)
     out["des_potencial_predic"] = out["des_potencial_predic"].astype(object)
-    out.loc[fresco_pend, "des_segmento_estrategica"] = POR_DEFINIR
+    out.loc[fresco_pend & ~pa_tabla, "des_segmento_estrategica"] = POR_DEFINIR
     out.loc[fresco_pend, "flg_potential"] = pd.NA
     out.loc[fresco_pend, "des_potencial_predic"] = None
 
     for col, heredar in (
         ("cod_boca_salida", granular),
         ("des_segmento_transaccional", regresa),
-        ("des_segmento_estrategica", misma & ~estrat_ant_pend),
+        ("des_segmento_estrategica", misma & ~estrat_ant_pend & ~pa_tabla),
         ("flg_potential", misma & ~potencial_ant_pend),
         ("des_potencial_predic", misma & ~potencial_ant_pend),
     ):
@@ -557,6 +638,7 @@ def detectar_regresiones(df_final: pd.DataFrame, gold_periodo_anterior: pd.DataF
 
 def validar_incremental(
     df_final: pd.DataFrame, gold_periodo_anterior: pd.DataFrame, salidas_clasificadas: Optional[pd.DataFrame] = None,
+    segmento_pa: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Cuenta cada grupo del modo incremental, para revisar ANTES de insertar.
 
@@ -575,6 +657,8 @@ def validar_incremental(
       (la alterna manda; conviene comparar contra lo que esperas del trax)
     - `regresan_a_por_definir`: tenían segmento y la alterna los trae "Por definir"; se conserva
       su fila anterior (ver `detectar_regresiones`)
+    - solo si se pasa `segmento_pa`: `pa_estadio_cambia` (PA con estadio en gold distinto al de la
+      tabla; toman el de la tabla) y `pa_por_definir_resueltos` (PA que estaban "Por definir")
     """
     cruce = _cruzar_con_anterior(df_final, gold_periodo_anterior)
     en_ant = cruce["_en_anterior"]
@@ -607,6 +691,13 @@ def validar_incremental(
         "transaccional_cambia": int((conservado & ~hoy_pendiente & transac_distinta).sum()),
         "regresan_a_por_definir": int(_regresa_a_por_definir(cruce, cambio_grupo).sum()),
     })
+    if segmento_pa is not None:
+        pa_tabla = _pa_en_tabla(cruce, segmento_pa)
+        valor = cruce["cod_interlocutor"].map(segmento_pa.set_index("cod_interlocutor")["des_segmento_estrategica"])
+        estrat_ant_pend = _es_pendiente(cruce["des_segmento_estrategica_ant"])
+        distinto = _bool(valor.fillna("") != cruce["des_segmento_estrategica_ant"].fillna(""))
+        res["pa_estadio_cambia"] = int((misma & pa_tabla & ~estrat_ant_pend & distinto).sum())
+        res["pa_por_definir_resueltos"] = int((misma & pa_tabla & estrat_ant_pend).sum())
     return res
 
 
@@ -625,16 +716,21 @@ def resumen_universo(df_armado: pd.DataFrame, df_reglas: pd.DataFrame) -> dict:
     }
 
 
-def preparar_carga_periodo(df_final: pd.DataFrame, modo: str, gold_periodo_anterior: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def preparar_carga_periodo(
+    df_final: pd.DataFrame, modo: str, gold_periodo_anterior: Optional[pd.DataFrame] = None,
+    segmento_pa: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """`modo='completo'`: `df_final` tal cual (solo el invariante de potencial).
     `modo='incremental'`: requiere `gold_periodo_anterior` y aplica `completar_incremental`.
+    `segmento_pa` solo afecta al incremental (ver `completar_incremental`); en `completo`, `df_final` ya
+    trae el estadio de PA si se le aplicó `aplicar_segmento_pa`.
     En ambos casos, listo para pasarlo a `cargar_periodo_gold`."""
     if modo == "completo":
         return aplicar_invariante_potencial(df_final)
     if modo == "incremental":
         if gold_periodo_anterior is None:
             raise ValueError("modo='incremental' necesita gold_periodo_anterior (la fila de gold del periodo anterior).")
-        return completar_incremental(df_final, gold_periodo_anterior)
+        return completar_incremental(df_final, gold_periodo_anterior, segmento_pa=segmento_pa)
     raise ValueError(f"modo debe ser 'completo' o 'incremental', recibió {modo!r}")
 
 

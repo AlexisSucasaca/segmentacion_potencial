@@ -12,11 +12,11 @@ import pandas as pd
 import pytest
 
 from src.segmentacion_gold import (
-    COLUMNAS_GOLD, aplicar_reglas_negocio, armar_df_final, cargar_periodo_gold, clasificar_salidas,
+    COLUMNAS_GOLD, aplicar_reglas_negocio, aplicar_segmento_pa, armar_df_final, cargar_periodo_gold, clasificar_salidas,
     combinar_potencial, completar_incremental, construir_insert_gold, detectar_regresiones,
     detectar_salidas, flag_mercado_potencial, grupo_boca, preparar_carga_periodo, ultimo_dia_mes,
     union_encuestas, union_potencial_clientes, union_potencial_mercado_pdm, validar_combinaciones,
-    validar_incremental,
+    preparar_segmento_pa, validar_incremental,
 )
 
 
@@ -452,3 +452,131 @@ def test_cargar_periodo_gold_se_niega_con_mas_de_un_periodo():
     df = pd.concat([_nuevo_calculado(), _gold_base()], ignore_index=True)
     with pytest.raises(ValueError, match="un solo periodo"):
         cargar_periodo_gold(df, _ClienteFalso(0), "p.d.gold", "p.d.staging")
+
+
+# ---------------------------------------------------------------- PA: estratégica exclusiva de la tabla de estadios
+def test_preparar_segmento_pa_normaliza_columnas_y_estadios():
+    df = pd.DataFrame({"cod_cliente_dex": [1, 2, 3, 4], "estadio": ["Estadio 1", "estadio 2", 3, "4.0"]})
+    out = preparar_segmento_pa(df)
+    assert out.set_index("cod_interlocutor")["des_segmento_estrategica"].to_dict() == {
+        "0000000001": "Estadio 1", "0000000002": "Estadio 2", "0000000003": "Estadio 3", "0000000004": "Estadio 4"}
+
+
+def test_preparar_segmento_pa_descarta_lo_no_interpretable_con_aviso():
+    df = pd.DataFrame({"cod_interlocutor": ["1", "2", None], "des_segmento_estrategica": ["Estadio 1", "Estadio 9", "Estadio 2"]})
+    with pytest.warns(UserWarning, match="se descartan"):
+        out = preparar_segmento_pa(df)
+    assert out["cod_interlocutor"].tolist() == ["0000000001"]
+
+
+def test_preparar_segmento_pa_rechaza_dos_estadios_para_un_cliente():
+    df = pd.DataFrame({"cod_cliente_dex": [1, 1], "estadio": ["Estadio 1", "Estadio 2"]})
+    with pytest.raises(ValueError, match="más de un estadio"):
+        preparar_segmento_pa(df)
+
+
+def test_preparar_segmento_pa_avisa_las_columnas_disponibles_si_no_las_encuentra():
+    with pytest.raises(KeyError, match="Columnas disponibles"):
+        preparar_segmento_pa(pd.DataFrame({"x": [1], "y": ["Estadio 1"]}))
+    out = preparar_segmento_pa(pd.DataFrame({"x": [1], "y": ["Estadio 1"]}), col_cliente="x", col_segmento="y")
+    assert len(out) == 1
+
+
+def _pa_fresco():
+    f = lambda *a, **k: _fila(*a, periodo="2026-06-01", fec="2026-06-30", **k)  # noqa: E731
+    return pd.DataFrame([
+        f("0000000001", "PA", "2 Oro", "Estadio 4", True, "High"),       # en tabla (Estadio 2)
+        f("0000000002", "PA", "2 Oro", "Estadio 1", True, "High"),       # NO está en la tabla
+        f("0000000003", "BO", "2 Oro", "Clásica", True, "High"),         # no es PA
+        f("0000000004", "PA", "Por definir", "Por definir", None, None),  # en tabla (Estadio 3), transaccional pendiente
+        f("0000000005", "PA", "2 Oro", "Por definir", True, "High"),     # en tabla (Estadio 4); en gold estaba "Por definir"
+        f("0000000006", "PA", "Por definir", "Por definir", None, None),  # NUEVO, transaccional pendiente, en tabla (Estadio 2)
+    ])
+
+
+def _tabla_pa():
+    return pd.DataFrame({"cod_interlocutor": ["0000000001", "0000000003", "0000000004", "0000000005", "0000000006"],
+                         "des_segmento_estrategica": ["Estadio 2", "Estadio 1", "Estadio 3", "Estadio 4", "Estadio 2"]})
+
+
+def test_aplicar_segmento_pa_solo_toca_pa_y_usa_unicamente_la_tabla():
+    out, resumen = aplicar_segmento_pa(_pa_fresco(), _tabla_pa())
+    out = out.set_index("cod_interlocutor")
+    assert out.loc["0000000001", "des_segmento_estrategica"] == "Estadio 2"      # tabla, no la de la alterna
+    assert out.loc["0000000002", "des_segmento_estrategica"] == "Por definir"    # PA sin tabla
+    assert out.loc["0000000003", "des_segmento_estrategica"] == "Clásica"        # BO: intacto, aunque esté en la tabla
+    assert resumen == {"pa_clientes": 5, "pa_con_tabla": 4, "pa_sin_tabla": 1}
+
+
+def test_aplicar_segmento_pa_no_muta_la_entrada():
+    fresco = _pa_fresco()
+    antes = fresco.copy()
+    aplicar_segmento_pa(fresco, _tabla_pa())
+    pd.testing.assert_frame_equal(fresco, antes)
+
+
+def _pa_gold():
+    f = lambda *a, **k: _fila(*a, periodo="2026-05-01", fec="2026-05-31", **k)  # noqa: E731
+    return pd.DataFrame([
+        f("0000000001", "PA", "2 Oro", "Estadio 1", True, "High"),       # gold Estadio 1, tabla Estadio 2
+        f("0000000002", "PA", "2 Oro", "Estadio 3", True, "High"),       # gold Estadio 3, no está en la tabla
+        f("0000000003", "BO", "2 Oro", "Clásica", True, "High"),
+        f("0000000004", "PA", "2 Oro", "Estadio 2", True, "High"),       # gold Estadio 2, tabla Estadio 3, transaccional hoy pendiente
+        f("0000000005", "PA", "Por definir", "Por definir", None, None),  # estaba "Por definir"
+    ])
+
+
+def _inc_pa():
+    fresco, resumen = aplicar_segmento_pa(_pa_fresco(), _tabla_pa())
+    return completar_incremental(fresco, _pa_gold(), segmento_pa=_tabla_pa()).set_index("cod_interlocutor")
+
+
+def test_incremental_pa_en_tabla_toma_siempre_el_estadio_de_la_tabla():
+    out = _inc_pa()
+    assert out.loc["0000000001", "des_segmento_estrategica"] == "Estadio 2"      # gold tenía Estadio 1
+    assert out.loc["0000000001", "des_potencial_predic"] == "High"               # el potencial sigue su regla (conserva)
+
+
+def test_incremental_pa_sin_tabla_conserva_su_estadio_de_gold():
+    assert _inc_pa().loc["0000000002", "des_segmento_estrategica"] == "Estadio 3"   # no regresa a "Por definir"
+
+
+def test_incremental_pa_con_segmento_en_gold_y_transaccional_pendiente_toma_el_estadio_y_conserva_lo_demas():
+    """La regresión del transaccional está bloqueada: conserva su fila anterior; solo el estadio viene de la tabla."""
+    fila = _inc_pa().loc["0000000004"]
+    assert fila["des_segmento_estrategica"] == "Estadio 3"                         # gold tenía Estadio 2
+    assert fila["des_segmento_transaccional"] == "2 Oro"
+    assert fila["flg_potential"] == True and fila["des_potencial_predic"] == "High"  # noqa: E712
+
+
+def test_incremental_pa_nuevo_con_transaccional_pendiente_toma_el_estadio_sin_potencial():
+    fila = _inc_pa().loc["0000000006"]
+    assert fila["des_segmento_estrategica"] == "Estadio 2"                         # la tabla manda aunque el transaccional sea pendiente
+    assert pd.isna(fila["flg_potential"]) and pd.isna(fila["des_potencial_predic"])
+
+
+def test_incremental_pa_que_estaba_por_definir_se_resuelve_con_la_tabla_y_toma_potencial_fresco():
+    fila = _inc_pa().loc["0000000005"]
+    assert fila["des_segmento_estrategica"] == "Estadio 4" and fila["des_segmento_transaccional"] == "2 Oro"
+    assert fila["flg_potential"] == True and fila["des_potencial_predic"] == "High"  # noqa: E712
+
+
+def test_incremental_sin_tabla_de_pa_se_comporta_como_antes():
+    fresco = _pa_fresco()
+    a = completar_incremental(fresco, _pa_gold())
+    b = completar_incremental(fresco, _pa_gold(), segmento_pa=None)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_validar_incremental_cuenta_los_cambios_de_pa():
+    fresco, _ = aplicar_segmento_pa(_pa_fresco(), _tabla_pa())
+    v = validar_incremental(fresco, _pa_gold(), segmento_pa=_tabla_pa())
+    assert v["pa_estadio_cambia"] == 2          # 1 (1 -> 2) y 4 (2 -> 3)
+    assert v["pa_por_definir_resueltos"] == 1   # 5
+    assert "pa_estadio_cambia" not in validar_incremental(fresco, _pa_gold())
+
+
+def test_preparar_carga_periodo_pasa_la_tabla_de_pa_al_incremental():
+    fresco, _ = aplicar_segmento_pa(_pa_fresco(), _tabla_pa())
+    out = preparar_carga_periodo(fresco, "incremental", gold_periodo_anterior=_pa_gold(), segmento_pa=_tabla_pa())
+    assert out.set_index("cod_interlocutor").loc["0000000001", "des_segmento_estrategica"] == "Estadio 2"

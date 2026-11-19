@@ -126,6 +126,12 @@ Dos modos:
     con segmento que la alterna trae "Por definir" no regresa: conserva su fila anterior y se
     lista para revisarlo.
 
+**PA**: para los clientes de boca `PA`, el segmento estratégico (Estadio 1 a 4) sale
+**exclusivamente** de la tabla consolidada de estadios (`TABLA_SEGMENTO_PA`, en el sandbox), en los dos
+modos; lo que traiga la alterna no cuenta. Un PA que no está en la tabla queda "Por definir" (en
+el incremental conserva el estadio de gold, si lo tenía). En el incremental, un PA de la tabla toma
+siempre el estadio de la tabla (el potencial sigue la regla normal).
+
 En los dos modos, `periodo` y `fec_proceso` (el último día del mes de `periodo`) son los del
 cálculo del periodo, y se aplica al final el invariante `flg_potential = False` ⇒
 `des_potencial_predic = NULL`.
